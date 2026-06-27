@@ -16,7 +16,13 @@
 import torch
 from tensordict import TensorDict
 
-from verl.trainer.ppo.core_algos import agg_loss, compute_value_loss, get_policy_loss_fn, kl_penalty
+from verl.trainer.ppo.core_algos import (
+    DMPO_POLICY_LOSS_MODES,
+    agg_loss,
+    compute_value_loss,
+    get_policy_loss_fn,
+    kl_penalty,
+)
 from verl.utils import tensordict_utils as tu
 from verl.utils.dataset.dataset_utils import DatasetPadMode
 from verl.utils.metric import AggregationType, Metric
@@ -82,12 +88,22 @@ def ppo_loss(config: ActorConfig, model_output, data: TensorDict, dp_group=None)
 
     metrics = {}
 
+    loss_agg_mode = config.loss_agg_mode
+    loss_mode = config.policy_loss.get("loss_mode", "vanilla")
+    group_index = None
+    if loss_mode in DMPO_POLICY_LOSS_MODES:
+        group_index = tu.get(data, "uid", None)
+        if group_index is None:
+            raise ValueError("DMPO policy losses require uid in the training batch.")
+
     # select fields and convert to padded tensor
     fields = ["response_mask", "old_log_probs", "advantages"]
     if "rollout_is_weights" in data:
         fields.append("rollout_is_weights")
     if "ref_log_prob" in data:
         fields.append("ref_log_prob")
+    if loss_mode in DMPO_POLICY_LOSS_MODES and "token_level_scores" in data:
+        fields.append("token_level_scores")
     data = data.select(*fields).to_padded_tensor()
 
     response_mask = data["response_mask"].to(bool)
@@ -95,21 +111,23 @@ def ppo_loss(config: ActorConfig, model_output, data: TensorDict, dp_group=None)
     old_log_prob = data["old_log_probs"]
     advantages = data["advantages"]
     rollout_is_weights = data.get("rollout_is_weights", None)
+    token_level_scores = data.get("token_level_scores", None)
 
-    loss_agg_mode = config.loss_agg_mode
-
-    loss_mode = config.policy_loss.get("loss_mode", "vanilla")
+    policy_loss_kwargs = {
+        "old_log_prob": old_log_prob,
+        "log_prob": log_prob,
+        "advantages": advantages,
+        "response_mask": response_mask,
+        "loss_agg_mode": loss_agg_mode,
+        "config": config,
+        "rollout_is_weights": rollout_is_weights,
+    }
+    if loss_mode in DMPO_POLICY_LOSS_MODES:
+        policy_loss_kwargs["index"] = group_index
+        policy_loss_kwargs["token_level_scores"] = token_level_scores
 
     policy_loss_fn = get_policy_loss_fn(loss_mode)
-    pg_loss, pg_metrics = policy_loss_fn(
-        old_log_prob=old_log_prob,
-        log_prob=log_prob,
-        advantages=advantages,
-        response_mask=response_mask,
-        loss_agg_mode=loss_agg_mode,
-        config=config,
-        rollout_is_weights=rollout_is_weights,
-    )
+    pg_loss, pg_metrics = policy_loss_fn(**policy_loss_kwargs)
 
     # AggregationType.MEAN for pg metrics: assumes policy_loss_fn normalizes by local_bsz/local_tokens
     # Ex: in compute_policy_loss_vanilla, pg_metrics are pg_clipfrac, ppo_kl, pg_clipfrac_lower

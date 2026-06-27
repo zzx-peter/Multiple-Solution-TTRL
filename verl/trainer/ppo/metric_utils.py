@@ -551,6 +551,17 @@ def calc_maj_val(data: list[dict[str, Any]], vote_key: str, val_key: str) -> flo
     return maj_val
 
 
+def calc_causal_recovery(data: list[dict[str, Any]]) -> float:
+    """Calculate HypoSpace Recovery from sampled causal predictions."""
+    n_ground_truths = 0
+    recovered = set()
+    for item in data:
+        n_ground_truths = max(n_ground_truths, int(item.get("n_ground_truths") or 0))
+        if item.get("valid") and item.get("pred"):
+            recovered.add(item["pred"])
+    return len(recovered) / n_ground_truths if n_ground_truths > 0 else 0.0
+
+
 def process_validation_metrics(
     data_sources: list[str], sample_uids: list[str], infos_dict: dict[str, list[Any]], seed: int = 42
 ) -> dict[str, dict[str, dict[str, float]]]:
@@ -634,6 +645,37 @@ def process_validation_metrics(
             pred_vals = var2vals.get("pred")
             has_pred = pred_vals is not None
             var_dict = uid_dict.setdefault(uid, {})
+            causal_pred_vals = var2vals.get("causal_pred")
+            causal_valid_vals = var2vals.get("causal_valid")
+            causal_n_ground_truth_vals = var2vals.get("causal_n_ground_truths")
+            if (
+                data_source == "causal"
+                and causal_pred_vals is not None
+                and causal_valid_vals is not None
+                and causal_n_ground_truth_vals is not None
+            ):
+                recovery_data = [
+                    {"pred": pred, "valid": valid, "n_ground_truths": n_ground_truths}
+                    for pred, valid, n_ground_truths in zip(
+                        causal_pred_vals, causal_valid_vals, causal_n_ground_truth_vals
+                    )
+                ]
+                n_resps = len(recovery_data)
+                recovery_metric = {f"mean@{n_resps}": calc_causal_recovery(recovery_data)}
+                if n_resps > 1:
+                    if n_resps not in ns_cache:
+                        ns_cache[n_resps] = gen_ns(n_resps)
+                    for n in ns_cache[n_resps]:
+                        [(recovery_mean, recovery_std)] = bootstrap_metric(
+                            data=recovery_data,
+                            subset_size=n,
+                            reduce_fns=[calc_causal_recovery],
+                            n_bootstrap=n_bootstrap,
+                            seed=seed,
+                        )
+                        recovery_metric[f"recovery@{n}/mean"] = recovery_mean
+                        recovery_metric[f"recovery@{n}/std"] = recovery_std
+                var_dict["causal_recovery"] = recovery_metric
 
             for var_name, var_vals in var2vals.items():
                 # skip empty or string values

@@ -542,6 +542,23 @@ class TestProcessValidationMetrics(unittest.TestCase):
         # For bootstrap with n=2, the majority vote could be either A or B
         # depending on the random sampling, so we don't check the exact value
 
+    def test_process_validation_metrics_causal_recovery(self):
+        """Test HypoSpace causal recovery across repeated validation samples."""
+        data_sources = ["causal", "causal", "causal", "causal"]
+        sample_inputs = ["prompt1", "prompt1", "prompt1", "prompt1"]
+        infos_dict = {
+            "acc": [1.0, 1.0, 0.0, 0.0],
+            "causal_pred": ["A->B", "B->C", "A->B", "C->A"],
+            "causal_valid": [1.0, 1.0, 0.0, 0.0],
+            "causal_n_ground_truths": [4, 4, 4, 4],
+        }
+
+        result = process_validation_metrics(data_sources, sample_inputs, infos_dict, seed=42)
+
+        self.assertIn("causal_recovery", result["causal"])
+        self.assertAlmostEqual(result["causal"]["causal_recovery"]["mean@4"], 0.5)
+        self.assertIn("recovery@4/mean", result["causal"]["causal_recovery"])
+
 
 if __name__ == "__main__":
     unittest.main()

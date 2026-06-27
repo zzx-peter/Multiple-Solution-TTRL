@@ -24,6 +24,9 @@ from verl.trainer.ppo.core_algos import (
     compute_gae_advantage_return,
     compute_grpo_outcome_advantage,
     compute_grpo_vectorized_outcome_advantage,
+    compute_policy_loss_grpo_dmpo,
+    compute_policy_loss_vanilla,
+    compute_ips_grpo_outcome_advantage,
     compute_rloo_outcome_advantage,
     compute_rloo_vectorized_outcome_advantage,
     get_adv_estimator_fn,
@@ -280,6 +283,45 @@ def test_grpo_vectorized_matches_original_for_low_variance_rewards():
     assert torch.allclose(ret1, ret2, rtol=1e-5, atol=1e-6)
 
 
+def test_ips_grpo_scales_rewards_by_group_trajectory_frequency():
+    token_level_rewards = torch.tensor([[1.0], [1.0], [1.0], [1.0]], dtype=torch.float32)
+    response_mask = torch.ones_like(token_level_rewards)
+    responses = torch.tensor([[10], [10], [20], [30]])
+    index = np.array(["prompt-a"] * 4, dtype=object)
+
+    adv, ret = compute_ips_grpo_outcome_advantage(
+        token_level_rewards=token_level_rewards,
+        response_mask=response_mask,
+        index=index,
+        responses=responses,
+        norm_adv_by_std_in_grpo=False,
+    )
+
+    expected = torch.tensor([[-1.0], [-1.0], [1.0], [1.0]], dtype=torch.float32)
+    assert torch.allclose(adv, expected)
+    assert torch.allclose(ret, expected)
+
+
+def test_ips_grpo_clips_extreme_low_trajectory_probability():
+    token_level_rewards = torch.tensor([[1.0], [2.0], [3.0], [4.0]], dtype=torch.float32)
+    response_mask = torch.ones_like(token_level_rewards)
+    responses = torch.tensor([[10], [20], [30], [40]])
+    index = np.array(["prompt-a"] * 4, dtype=object)
+
+    adv, ret = compute_ips_grpo_outcome_advantage(
+        token_level_rewards=token_level_rewards,
+        response_mask=response_mask,
+        index=index,
+        responses=responses,
+        norm_adv_by_std_in_grpo=False,
+        config={"ips_grpo_prob_clip_epsilon": 0.5},
+    )
+
+    expected = torch.tensor([[-3.0], [-1.0], [1.0], [3.0]], dtype=torch.float32)
+    assert torch.allclose(adv, expected)
+    assert torch.allclose(ret, expected)
+
+
 @pytest.mark.parametrize(
     "batch_size,seq_len,num_groups,seed",
     [
@@ -332,6 +374,56 @@ def test_grpo_and_vectorized_equivalence(batch_size: int, seq_len: int, num_grou
     assert ret1.shape == ret2.shape == (batch_size, seq_len)
     assert torch.allclose(adv1, adv2, rtol=1e-5, atol=1e-6)
     assert torch.allclose(ret1, ret2, rtol=1e-5, atol=1e-6)
+
+
+def test_grpo_dmpo_matches_reward_distribution_to_policy_distribution():
+    class Config:
+        clip_ratio = 0.2
+        clip_ratio_low = 0.2
+        clip_ratio_high = 0.2
+        global_batch_info = {}
+        policy_loss = {"dmpo_beta": 2.0, "dmpo_temperature": 1.0}
+
+        def get(self, key, default=None):
+            return getattr(self, key, default)
+
+    old_log_prob = torch.zeros(4, 2)
+    log_prob = torch.tensor([[-0.1, -0.3], [-1.0, -1.2], [-0.8, -0.6], [-0.2, -0.4]], requires_grad=True)
+    advantages = torch.ones(4, 2)
+    response_mask = torch.ones(4, 2, dtype=torch.bool)
+    token_level_scores = torch.tensor([[1.0, 0.0], [0.0, 0.0], [0.0, 0.0], [1.0, 0.0]])
+    index = np.array([10, 10, 42, 42])
+
+    loss, metrics = compute_policy_loss_grpo_dmpo(
+        old_log_prob=old_log_prob,
+        log_prob=log_prob,
+        advantages=advantages,
+        response_mask=response_mask,
+        config=Config(),
+        index=index,
+        token_level_scores=token_level_scores,
+    )
+
+    seq_log_prob = (log_prob * response_mask).sum(dim=-1) / response_mask.sum(dim=-1)
+    model_a = torch.softmax(seq_log_prob[:2], dim=0)
+    model_b = torch.softmax(seq_log_prob[2:], dim=0)
+    target = torch.softmax(torch.tensor([1.0, 0.0]), dim=0)
+    expected_dmpo = torch.cat([(target - model_a).square(), (target.flip(0) - model_b).square()]).mean()
+    grpo_loss, _ = compute_policy_loss_vanilla(
+        old_log_prob=old_log_prob,
+        log_prob=log_prob,
+        advantages=advantages,
+        response_mask=response_mask,
+        config=Config(),
+    )
+
+    assert torch.allclose(loss - grpo_loss, expected_dmpo * 2.0)
+    assert torch.isfinite(loss)
+    assert metrics["actor/dmpo_beta"] == 2.0
+    assert metrics["actor/dmpo_temperature"] == 1.0
+    loss.backward()
+    assert log_prob.grad is not None
+    assert torch.isfinite(log_prob.grad).all()
 
 
 @pytest.mark.parametrize(

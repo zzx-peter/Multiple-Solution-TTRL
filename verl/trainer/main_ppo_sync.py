@@ -138,7 +138,12 @@ def compute_advantage_for_multi_trajectories(
     in ``batch_keys``. Non-GRPO estimators, such as GAE, are delegated to the
     original ``compute_advantage()`` unchanged.
     """
-    if adv_estimator != core_algos.AdvantageEstimator.GRPO:
+    if adv_estimator not in (
+        core_algos.AdvantageEstimator.GRPO,
+        core_algos.AdvantageEstimator.IPS_GRPO,
+        "grpo",
+        "ips_grpo",
+    ):
         return compute_advantage(
             data,
             adv_estimator=adv_estimator,
@@ -1148,9 +1153,10 @@ class PPOTrainer:
             for var_name, metric2val in var2metric2val.items():
                 n_max = max([int(name.split("@")[-1].split("/")[0]) for name in metric2val.keys()])
                 for metric_name, metric_val in metric2val.items():
+                    is_causal_recovery = data_source in ("causal", "causel") and var_name == "causal_recovery"
                     if (
-                        (var_name == core_var)
-                        and any(metric_name.startswith(pfx) for pfx in ["mean", "maj", "best"])
+                        (var_name == core_var or is_causal_recovery)
+                        and any(metric_name.startswith(pfx) for pfx in ["mean", "maj", "best", "recovery"])
                         and (f"@{n_max}" in metric_name)
                     ):
                         metric_sec = "val-core"
@@ -1405,6 +1411,8 @@ class PPOTrainer:
     def _compute_advantage(self, batch: KVBatchMeta, metrics: dict) -> KVBatchMeta:
         """Compute the advantage of the batch."""
         fields = ["uid", "response_mask", "rm_scores", "rollout_log_probs", "old_log_probs", "ref_log_prob", "values"]
+        if self.config.algorithm.adv_estimator in (core_algos.AdvantageEstimator.IPS_GRPO, "ips_grpo"):
+            fields.append("responses")
         if self.config.algorithm.adv_estimator == core_algos.AdvantageEstimator.REMAX:
             fields.append("reward_baselines")
         data = tq.kv_batch_get(keys=batch.keys, partition_id=batch.partition_id, select_fields=fields)

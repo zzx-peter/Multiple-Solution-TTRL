@@ -259,6 +259,10 @@ def compute_advantage(
         if adv_estimator in (AdvantageEstimator.GDPO, "gdpo"):
             adv_kwargs["non_tensor_batch"] = data.non_tensor_batch
             adv_kwargs["batch"] = data.batch
+        if adv_estimator in (AdvantageEstimator.IPS_GRPO, "ips_grpo"):
+            adv_kwargs["norm_adv_by_std_in_grpo"] = norm_adv_by_std_in_grpo
+            if "responses" in data.batch:
+                adv_kwargs["responses"] = data.batch["responses"]
         # Add sum_pi_squared for Optimal Token Baseline
         if adv_estimator in (AdvantageEstimator.OPTIMAL_TOKEN_BASELINE, AdvantageEstimator.TIR_OPTIMAL_TOKEN_BASELINE):
             # Check if sum_pi_squared is available
@@ -729,9 +733,10 @@ class RayPPOTrainer:
             for var_name, metric2val in var2metric2val.items():
                 n_max = max([int(name.split("@")[-1].split("/")[0]) for name in metric2val.keys()])
                 for metric_name, metric_val in metric2val.items():
+                    is_causal_recovery = data_source in ("causal", "causel") and var_name == "causal_recovery"
                     if (
-                        (var_name == core_var)
-                        and any(metric_name.startswith(pfx) for pfx in ["mean", "maj", "best"])
+                        (var_name == core_var or is_causal_recovery)
+                        and any(metric_name.startswith(pfx) for pfx in ["mean", "maj", "best", "recovery"])
                         and (f"@{n_max}" in metric_name)
                     ):
                         metric_sec = "val-core"
@@ -1445,7 +1450,19 @@ class RayPPOTrainer:
                 # pass global_steps to trace
                 gen_batch.meta_info["global_steps"] = self.global_steps
                 rollout_n = self.config.actor_rollout_ref.rollout.n
-                gen_batch_output = gen_batch.repeat(repeat_times=rollout_n, interleave=True)
+                ttrl_config = self.config.get("ttrl", {})
+                ttrl_enabled = bool(ttrl_config.get("enable", False))
+                n_samples_per_prompt = int(ttrl_config.get("n_samples_per_prompt", rollout_n))
+                n_votes_per_prompt = int(ttrl_config.get("n_votes_per_prompt", rollout_n))
+                if ttrl_enabled:
+                    if self.config.algorithm.adv_estimator != AdvantageEstimator.GRPO:
+                        raise ValueError("TTRL currently expects algorithm.adv_estimator=grpo")
+                    if n_samples_per_prompt != rollout_n:
+                        raise ValueError("TTRL n_samples_per_prompt must match actor_rollout_ref.rollout.n")
+                    if n_votes_per_prompt < n_samples_per_prompt:
+                        raise ValueError("TTRL n_votes_per_prompt must be >= n_samples_per_prompt")
+                gen_repeat_times = n_votes_per_prompt if ttrl_enabled else rollout_n
+                gen_batch_output = gen_batch.repeat(repeat_times=gen_repeat_times, interleave=True)
 
                 if self.config.algorithm.adv_estimator == AdvantageEstimator.REMAX:
                     # NOTE: REMAX needs one sampled rollout plus one greedy baseline per prompt.
@@ -1492,9 +1509,26 @@ class RayPPOTrainer:
                         batch.batch["reward_baselines"] = reward_baseline_tensor
 
                         del gen_baseline_output
+
+                    if ttrl_enabled:
+                        from verl.trainer.ppo.ttrl_utils import apply_ttrl_gt, select_top_k_per_prompt
+
+                        batch = apply_ttrl_gt(batch, gen_batch_output, n_votes_per_prompt, self.tokenizer)
+                        gen_batch_output = select_top_k_per_prompt(
+                            gen_batch_output,
+                            n_votes_per_prompt=n_votes_per_prompt,
+                            n_samples_per_prompt=n_samples_per_prompt,
+                        )
+
+                        if "rm_scores" in gen_batch_output.batch.keys():
+                            gen_batch_output.batch.pop("rm_scores")
+                        reward_extra_keys = gen_batch_output.meta_info.pop("reward_extra_keys", [])
+                        for key in reward_extra_keys:
+                            if key in gen_batch_output.non_tensor_batch:
+                                gen_batch_output.non_tensor_batch.pop(key)
                     del combined_gen_batch, combined_gen_output
                     # repeat to align with repeated responses in rollout
-                    batch = batch.repeat(repeat_times=self.config.actor_rollout_ref.rollout.n, interleave=True)
+                    batch = batch.repeat(repeat_times=n_samples_per_prompt, interleave=True)
                     batch = batch.union(gen_batch_output)
 
                     if "response_mask" not in batch.batch.keys():
@@ -1510,14 +1544,17 @@ class RayPPOTrainer:
                     batch.meta_info["global_token_num"] = torch.sum(batch.batch["attention_mask"], dim=-1).tolist()
                     # get images_seqlens
                     images_seqlens_all = []
-                    for multi_modal_input in batch.non_tensor_batch["multi_modal_inputs"]:
-                        if "image_grid_thw" not in multi_modal_input.keys():
+                    for multi_modal_input in batch.non_tensor_batch.get("multi_modal_inputs", []):
+                        if not multi_modal_input or "image_grid_thw" not in multi_modal_input.keys():
                             continue
                         images_seqlens_all.extend(multi_modal_input["images_seqlens"].tolist())
                     batch.meta_info["images_seqlens"] = images_seqlens_all
                     with marked_timer("reward", timing_raw, color="yellow"):
                         # compute reward model score
-                        if self.use_rm and "rm_scores" not in batch.batch.keys():
+                        if ttrl_enabled and "rm_scores" not in batch.batch.keys():
+                            batch_reward = self.reward_loop_manager.compute_rm_score(batch)
+                            batch = batch.union(batch_reward)
+                        elif self.use_rm and "rm_scores" not in batch.batch.keys():
                             batch_reward = self._compute_reward_colocate(batch)
                             batch = batch.union(batch_reward)
 

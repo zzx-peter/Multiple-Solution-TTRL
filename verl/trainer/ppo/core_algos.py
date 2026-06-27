@@ -34,20 +34,11 @@ from verl.utils import as_torch_index, group_mean_std
 from verl.utils.import_utils import deprecated
 from verl.workers.config import ActorConfig
 
-PolicyLossFn = Callable[
-    [
-        torch.Tensor,  # old_log_prob
-        torch.Tensor,  # log_prob
-        torch.Tensor,  # advantages
-        torch.Tensor,  # response_mask
-        str,  # loss_agg_mode
-        Optional[DictConfig | ActorConfig],  # config
-        torch.Tensor | None,  # rollout_log_probs
-    ],
-    tuple[torch.Tensor, dict[str, Any]],
-]
+PolicyLossFn = Callable[..., tuple[torch.Tensor, dict[str, Any]]]
 
 POLICY_LOSS_REGISTRY: dict[str, PolicyLossFn] = {}
+
+DMPO_POLICY_LOSS_MODES = frozenset({"grpo_dmpo"})
 
 
 def register_policy_loss(name: str) -> Callable[[PolicyLossFn], PolicyLossFn]:
@@ -96,6 +87,7 @@ class AdvantageEstimator(str, Enum):
 
     GAE = "gae"
     GRPO = "grpo"
+    IPS_GRPO = "ips_grpo"
     REINFORCE_PLUS_PLUS = "reinforce_plus_plus"
     REINFORCE_PLUS_PLUS_BASELINE = "reinforce_plus_plus_baseline"
     REMAX = "remax"
@@ -356,6 +348,70 @@ def compute_grpo_vectorized_outcome_advantage(
             scalars = scores - mean_g[g]
         advantages = scalars.unsqueeze(-1) * response_mask
         return advantages, advantages
+
+
+@register_adv_est(AdvantageEstimator.IPS_GRPO)
+def compute_ips_grpo_outcome_advantage(
+    token_level_rewards: torch.Tensor,
+    response_mask: torch.Tensor,
+    index: np.ndarray,
+    responses: Optional[torch.Tensor] = None,
+    epsilon: float = 1e-6,
+    norm_adv_by_std_in_grpo: bool = True,
+    config: Optional[AlgoConfig] = None,
+    **kwargs,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """
+    IPS-GRPO: scale each trajectory reward by the inverse clipped group
+    frequency of the same trajectory, then apply standard GRPO normalization.
+    """
+    with torch.no_grad():
+        scores = token_level_rewards.sum(dim=-1)
+        scaled_scores = scores.clone()
+        prob_floor = config.get("ips_grpo_prob_clip_epsilon", epsilon) if config is not None else epsilon
+
+        id2traj_count = defaultdict(lambda: defaultdict(int))
+        id2traj_key = {}
+        bsz = scores.shape[0]
+
+        for i in range(bsz):
+            if responses is None:
+                traj_key = (float(scores[i].detach().cpu()),)
+            else:
+                traj_key = tuple(responses[i][response_mask[i].bool()].detach().cpu().tolist())
+            group_id = index[i]
+            id2traj_key[i] = traj_key
+            id2traj_count[group_id][traj_key] += 1
+
+        for i in range(bsz):
+            group_id = index[i]
+            group_size = sum(id2traj_count[group_id].values())
+            traj_count = id2traj_count[group_id][id2traj_key[i]]
+            traj_prob = max(traj_count / group_size, prob_floor)
+            scaled_scores[i] = scores[i] / traj_prob
+
+        id2score = defaultdict(list)
+        for i in range(bsz):
+            id2score[index[i]].append(scaled_scores[i])
+
+        id2mean, id2std = {}, {}
+        for idx, group_scores in id2score.items():
+            if len(group_scores) == 1:
+                id2mean[idx] = scaled_scores.new_tensor(0.0)
+                id2std[idx] = scaled_scores.new_tensor(1.0)
+            else:
+                scores_tensor = torch.stack(group_scores)
+                id2mean[idx] = scores_tensor.mean()
+                id2std[idx] = scores_tensor.std()
+
+        for i in range(bsz):
+            if norm_adv_by_std_in_grpo:
+                scaled_scores[i] = (scaled_scores[i] - id2mean[index[i]]) / (id2std[index[i]] + epsilon)
+            else:
+                scaled_scores[i] = scaled_scores[i] - id2mean[index[i]]
+
+        advantages = scaled_scores.unsqueeze(-1) * response_mask
+    return advantages, advantages
 
 
 @register_adv_est(AdvantageEstimator.GDPO)  # or simply: @register_adv_est("gdpo")
@@ -1367,6 +1423,72 @@ def compute_policy_loss_vanilla(
         "actor/pg_clipfrac_lower": pg_clipfrac_lower.detach().item(),
     }
     return pg_loss, pg_metrics
+
+
+def _group_softmax(logits: torch.Tensor, group_index: torch.Tensor, eps: float = 1e-10) -> torch.Tensor:
+    num_groups = int(group_index.max().item()) + 1
+    group_max = torch.full((num_groups,), float("-inf"), device=logits.device, dtype=logits.dtype)
+    group_max.scatter_reduce_(0, group_index, logits, reduce="amax", include_self=False)
+
+    exp_logits = torch.exp(logits - group_max[group_index])
+    group_sum = torch.zeros(num_groups, device=logits.device, dtype=logits.dtype)
+    group_sum.index_add_(0, group_index, exp_logits)
+    return exp_logits / (group_sum[group_index] + eps)
+
+
+@register_policy_loss("grpo_dmpo")  # type: ignore[arg-type]
+def compute_policy_loss_grpo_dmpo(
+    old_log_prob: torch.Tensor,
+    log_prob: torch.Tensor,
+    advantages: torch.Tensor,
+    response_mask: torch.Tensor,
+    loss_agg_mode: str = "token-mean",
+    config: Optional[ActorConfig] = None,
+    rollout_is_weights: torch.Tensor | None = None,
+    index: torch.Tensor | np.ndarray | None = None,
+    token_level_scores: torch.Tensor | None = None,
+) -> tuple[torch.Tensor, dict[str, Any]]:
+    """Compute standard clipped GRPO/PPO plus the DMPO distribution-matching term."""
+    if index is None:
+        raise ValueError("DMPO policy loss requires uid group index in the training batch.")
+    assert config is not None
+
+    pg_loss, metrics = compute_policy_loss_vanilla(
+        old_log_prob=old_log_prob,
+        log_prob=log_prob,
+        advantages=advantages,
+        response_mask=response_mask,
+        loss_agg_mode=loss_agg_mode,
+        config=config,
+        rollout_is_weights=rollout_is_weights,
+    )
+
+    group_index = as_torch_index(index, device=log_prob.device)
+    _, group_index = torch.unique(group_index, sorted=True, return_inverse=True)
+    if group_index.numel() != log_prob.shape[0]:
+        raise ValueError(f"DMPO uid count {group_index.numel()} does not match batch size {log_prob.shape[0]}.")
+
+    mask = response_mask.to(log_prob.dtype)
+    response_len = mask.sum(dim=-1).clamp(min=1)
+    seq_log_prob = (log_prob * mask).sum(dim=-1) / response_len
+    scores = token_level_scores if token_level_scores is not None else advantages
+    seq_scores = (scores * mask).sum(dim=-1)
+
+    beta = float(config.policy_loss.get("dmpo_beta", 1.0))
+    temperature = float(config.policy_loss.get("dmpo_temperature", 1.0 / 15.0))
+    with torch.no_grad():
+        target_dist = _group_softmax(seq_scores / temperature, group_index)
+    policy_dist = _group_softmax(seq_log_prob, group_index)
+    dmpo_loss = (target_dist - policy_dist).square().mean()
+
+    metrics.update(
+        {
+            "actor/dmpo_loss": dmpo_loss.detach().item(),
+            "actor/dmpo_beta": beta,
+            "actor/dmpo_temperature": temperature,
+        }
+    )
+    return pg_loss + beta * dmpo_loss, metrics
 
 
 @register_policy_loss("dppo_tv")
