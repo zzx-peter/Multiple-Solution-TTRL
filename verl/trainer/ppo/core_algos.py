@@ -356,32 +356,73 @@ def compute_ips_grpo_outcome_advantage(
     response_mask: torch.Tensor,
     index: np.ndarray,
     responses: Optional[torch.Tensor] = None,
+    non_tensor_batch: Optional[dict] = None,
     epsilon: float = 1e-6,
     norm_adv_by_std_in_grpo: bool = True,
     config: Optional[AlgoConfig] = None,
     **kwargs,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """
-    IPS-GRPO: scale each trajectory reward by the inverse clipped group
-    frequency of the same trajectory, then apply standard GRPO normalization.
+    IPS-GRPO: scale each response reward by the inverse clipped group
+    frequency of the same final answer, then apply standard GRPO normalization.
     """
     with torch.no_grad():
         scores = token_level_rewards.sum(dim=-1)
         scaled_scores = scores.clone()
         prob_floor = config.get("ips_grpo_prob_clip_epsilon", epsilon) if config is not None else epsilon
+        answer_key = config.get("ips_grpo_answer_key", None) if config is not None else None
+        answer_key_candidates = [answer_key, "causal_pred", "pred"] if answer_key else ["causal_pred", "pred"]
+        debug_print_answers = config.get("ips_grpo_debug_print_answers", True) if config is not None else True
+        debug_answer_max_chars = config.get("ips_grpo_debug_answer_max_chars", 200) if config is not None else 200
+
+        final_answers = None
+        final_answer_field = None
+        if non_tensor_batch is not None:
+            for key in answer_key_candidates:
+                if key in non_tensor_batch:
+                    values = non_tensor_batch[key]
+                    if len(values) == scores.shape[0]:
+                        final_answers = values
+                        final_answer_field = key
+                        break
 
         id2traj_count = defaultdict(lambda: defaultdict(int))
         id2traj_key = {}
         bsz = scores.shape[0]
 
         for i in range(bsz):
-            if responses is None:
+            if final_answers is not None:
+                answer = final_answers[i]
+                if isinstance(answer, np.generic):
+                    answer = answer.item()
+                traj_key = (final_answer_field, str(answer))
+            elif responses is None:
                 traj_key = (float(scores[i].detach().cpu()),)
             else:
                 traj_key = tuple(responses[i][response_mask[i].bool()].detach().cpu().tolist())
             group_id = index[i]
             id2traj_key[i] = traj_key
             id2traj_count[group_id][traj_key] += 1
+
+        if debug_print_answers:
+            count_key_name = final_answer_field or "raw_response_tokens"
+            print(f"[IPS-GRPO debug] count_key={count_key_name} prob_floor={prob_floor}")
+            for group_id, traj_counts in id2traj_count.items():
+                group_size = sum(traj_counts.values())
+                print(f"[IPS-GRPO debug] uid={group_id} group_size={group_size}")
+                for traj_key, traj_count in sorted(traj_counts.items(), key=lambda item: (-item[1], str(item[0]))):
+                    traj_prob = traj_count / group_size
+                    clipped_prob = max(traj_prob, prob_floor)
+                    if final_answers is not None:
+                        answer_text = traj_key[1]
+                    else:
+                        answer_text = f"<{count_key_name}: len={len(traj_key)}>"
+                    if len(answer_text) > debug_answer_max_chars:
+                        answer_text = answer_text[:debug_answer_max_chars] + "..."
+                    print(
+                        "[IPS-GRPO debug] "
+                        f"answer={answer_text!r} count={traj_count} prob={traj_prob:.6f} clipped_prob={clipped_prob:.6f}"
+                    )
 
         for i in range(bsz):
             group_id = index[i]

@@ -261,6 +261,7 @@ def compute_advantage(
             adv_kwargs["batch"] = data.batch
         if adv_estimator in (AdvantageEstimator.IPS_GRPO, "ips_grpo"):
             adv_kwargs["norm_adv_by_std_in_grpo"] = norm_adv_by_std_in_grpo
+            adv_kwargs["non_tensor_batch"] = data.non_tensor_batch
             if "responses" in data.batch:
                 adv_kwargs["responses"] = data.batch["responses"]
         # Add sum_pi_squared for Optimal Token Baseline
@@ -1454,13 +1455,6 @@ class RayPPOTrainer:
                 ttrl_enabled = bool(ttrl_config.get("enable", False))
                 n_samples_per_prompt = int(ttrl_config.get("n_samples_per_prompt", rollout_n))
                 n_votes_per_prompt = int(ttrl_config.get("n_votes_per_prompt", rollout_n))
-                if ttrl_enabled:
-                    if self.config.algorithm.adv_estimator != AdvantageEstimator.GRPO:
-                        raise ValueError("TTRL currently expects algorithm.adv_estimator=grpo")
-                    if n_samples_per_prompt != rollout_n:
-                        raise ValueError("TTRL n_samples_per_prompt must match actor_rollout_ref.rollout.n")
-                    if n_votes_per_prompt < n_samples_per_prompt:
-                        raise ValueError("TTRL n_votes_per_prompt must be >= n_samples_per_prompt")
                 gen_repeat_times = n_votes_per_prompt if ttrl_enabled else rollout_n
                 gen_batch_output = gen_batch.repeat(repeat_times=gen_repeat_times, interleave=True)
 

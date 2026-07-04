@@ -53,6 +53,8 @@ python3 -m verl.trainer.main_ppo \
     actor_rollout_ref.rollout.agent.num_workers=1 \
     actor_rollout_ref.rollout.n=2 \
     actor_rollout_ref.rollout.val_kwargs.n=2 \
+    actor_rollout_ref.rollout.val_kwargs.temperature=1.0 \
+    actor_rollout_ref.rollout.val_kwargs.do_sample=True \
     actor_rollout_ref.ref.log_prob_micro_batch_size_per_gpu=2 \
     actor_rollout_ref.ref.fsdp_config.param_offload=True \
     algorithm.use_kl_in_reward=False \

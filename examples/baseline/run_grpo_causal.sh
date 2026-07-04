@@ -4,8 +4,8 @@ export CUDA_VISIBLE_DEVICES=0
 export RAY_EXPERIMENTAL_NOSET_CUDA_VISIBLE_DEVICES=1
 export WANDB_API_KEY="3ad98c1a4043033c1a4ea70737ebb314a2f09ba0"
 export PYTHONPATH=/scratch/ophv164/code/verl-v0.8.0:$PYTHONPATH
-causal_path="/scratch/ophv164/data/hypespace/causal/train.parquet"
-causal_test_path="/scratch/ophv164/data/hypespace/causal/test.parquet"
+causal_path="/scratch/ophv164/data/hypespace/causal_reason/train.parquet"
+causal_test_path="/scratch/ophv164/data/hypespace/causal_reason/test.parquet"
 
 train_files="['$causal_path']"
 test_files="['$causal_test_path']"
@@ -21,7 +21,7 @@ gpu_memory_utilization=0.5
 offload=True
 
 project_name="mode_collaspe"
-experiment_name="Qwen3-1.7B-causal"
+experiment_name="Qwen3-1.7B-causal-reason"
 seed=1337
 
 main_model=/scratch/ophv164/model/Qwen3-1.7B
@@ -61,6 +61,8 @@ python3 -m verl.trainer.main_ppo \
     actor_rollout_ref.rollout.agent.num_workers=8 \
     actor_rollout_ref.rollout.n=8 \
     actor_rollout_ref.rollout.val_kwargs.n=16 \
+    actor_rollout_ref.rollout.val_kwargs.temperature=1.0 \
+    actor_rollout_ref.rollout.val_kwargs.do_sample=True \
     actor_rollout_ref.ref.log_prob_micro_batch_size_per_gpu=${mirco_bacth_size} \
     actor_rollout_ref.ref.fsdp_config.param_offload=${offload} \
     algorithm.use_kl_in_reward=False \
