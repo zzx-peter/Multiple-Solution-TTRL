@@ -507,6 +507,95 @@ class RayPPOTrainer:
                 still_pending.append(f)
         self._dump_futures = still_pending
 
+    @staticmethod
+    def _write_json(data, filename):
+        os.makedirs(os.path.dirname(filename), exist_ok=True)
+        with open(filename, "w") as f:
+            json.dump(data, f, ensure_ascii=False, indent=2, default=str)
+        print(f"Dumped MSTTRL inspection data to {filename}")
+
+    @staticmethod
+    def _write_jsonl(rows, filename):
+        os.makedirs(os.path.dirname(filename), exist_ok=True)
+        with open(filename, "w") as f:
+            for row in rows:
+                f.write(json.dumps(row, ensure_ascii=False, default=str) + "\n")
+        print(f"Dumped MSTTRL inspection data to {filename}")
+
+    def _msttrl_dump_dir(self):
+        msttrl_config = self.config.get("msttrl", {})
+        dump_dir = msttrl_config.get("dump_dir", None)
+        if dump_dir is None:
+            dump_dir = os.path.join(self.config.trainer.default_local_dir, "msttrl_inspect")
+        return dump_dir
+
+    def _dump_msttrl_rewards(self, batch: DataProto, epoch: int):
+        dump_dir = os.path.join(self._msttrl_dump_dir(), "rewards")
+        filename = os.path.join(dump_dir, f"epoch_{epoch}_step_{self.global_steps}.jsonl")
+
+        prompts = self.tokenizer.batch_decode(batch.batch["prompts"], skip_special_tokens=True)
+        responses = self.tokenizer.batch_decode(batch.batch["responses"], skip_special_tokens=True)
+        rewards = batch.batch["rm_scores"].sum(-1).detach().cpu().tolist()
+
+        def _list_from_non_tensor(key, default=""):
+            values = batch.non_tensor_batch.get(key, None)
+            if values is None:
+                return [default] * len(batch)
+            if hasattr(values, "tolist"):
+                values = values.tolist()
+            return list(values)
+
+        solution_modes = _list_from_non_tensor("msttrl_solution_mode")
+        prompt_keys = _list_from_non_tensor("msttrl_prompt_key")
+        final_answers = _list_from_non_tensor("msttrl_final_answer")
+        if all(answer == "" for answer in final_answers):
+            final_answers = _list_from_non_tensor("causal_pred")
+        if all(answer == "" for answer in final_answers):
+            final_answers = _list_from_non_tensor("pred")
+
+        def _item(values, index, default=""):
+            return values[index] if index < len(values) else default
+
+        rows = []
+        rows_by_prompt = {}
+        for i in range(len(batch)):
+            prompt_key = _item(prompt_keys, i)
+            if not prompt_key:
+                prompt_key = prompts[i]
+            if prompt_key not in rows_by_prompt:
+                row = {
+                    "epoch": epoch,
+                    "step": self.global_steps,
+                    "prompt_key": prompt_key,
+                    "prompt": prompts[i],
+                    "responses": [],
+                }
+                rows_by_prompt[prompt_key] = row
+                rows.append(row)
+            rows_by_prompt[prompt_key]["responses"].append(
+                {
+                    "response": responses[i],
+                    "final_answer": _item(final_answers, i),
+                    "solution_mode": _item(solution_modes, i),
+                    "reward": rewards[i],
+                }
+            )
+
+        future = self._dump_executor.submit(self._write_jsonl, rows, filename)
+        self._dump_futures.append(future)
+
+    def _dump_msttrl_memory_bank(self, epoch: int):
+        if self.reward_loop_manager is None:
+            return
+        state = self.reward_loop_manager.get_reward_manager_state("msttrl")
+        workers = state.get("workers", [])
+        if len(workers) == 1:
+            state = {**state, **workers[0]}
+        data = {"epoch": epoch, "step": self.global_steps, **state}
+        filename = os.path.join(self._msttrl_dump_dir(), "memory_bank", f"epoch_{epoch}.json")
+        future = self._dump_executor.submit(self._write_json, data, filename)
+        self._dump_futures.append(future)
+
     def _init_dump_executor(self):
         """Create or recreate the dump executor and futures list."""
         self._dump_executor = ThreadPoolExecutor(max_workers=1)
@@ -604,6 +693,10 @@ class RayPPOTrainer:
     def _validate(self, merged: bool = False):
         data_source_lst = []
         reward_extra_infos_dict: dict[str, list] = defaultdict(list)
+        ttrl_config = self.config.get("ttrl", {})
+        ttrl_enabled = bool(ttrl_config.get("enable", False))
+        msttrl_config = self.config.get("msttrl", {})
+        msttrl_enabled = bool(msttrl_config.get("enable", False))
 
         # Lists to collect samples for the table
         sample_inputs = []
@@ -647,7 +740,13 @@ class RayPPOTrainer:
             test_gen_batch_padded, pad_size = pad_dataproto_to_divisor(test_gen_batch, size_divisor)
             test_output_gen_batch_padded = self.async_rollout_manager.generate_sequences(test_gen_batch_padded)
 
-            if self.use_rm and "rm_scores" not in test_output_gen_batch_padded.batch.keys():
+            if (ttrl_enabled or msttrl_enabled) and "rm_scores" not in test_output_gen_batch_padded.batch.keys():
+                reward_manager_name = "msttrl" if msttrl_enabled else None
+                batch_reward = self.reward_loop_manager.compute_rm_score(
+                    test_output_gen_batch_padded, reward_manager_name=reward_manager_name
+                )
+                test_output_gen_batch_padded = test_output_gen_batch_padded.union(batch_reward)
+            elif self.use_rm and "rm_scores" not in test_output_gen_batch_padded.batch.keys():
                 # for colocate reward models, we need to sleep rollout model
                 # to spare GPU memory for reward model
                 self.checkpoint_manager.sleep_replicas()
@@ -944,6 +1043,10 @@ class RayPPOTrainer:
         # agent_reward_loop: streaming reward computation with actor rollout
         # two conditions satisfied: (1) no reward model, or (2) reward model with extra resource pool
         enable_agent_reward_loop = not self.use_rm or self.config.reward.reward_model.enable_resource_pool
+        enable_agent_reward_loop = enable_agent_reward_loop and getattr(
+            self.reward_loop_manager.reward_manager_cls, "supports_agent_reward_loop", True
+        )
+        enable_agent_reward_loop = enable_agent_reward_loop and not self.config.get("msttrl", {}).get("enable", False)
 
         self.llm_server_manager = LLMServerManager.create(
             config=self.config, worker_group=self.actor_rollout_wg, rollout_resource_pool=actor_rollout_resource_pool
@@ -1426,7 +1529,7 @@ class RayPPOTrainer:
         next_step_profile = False
 
         for epoch in range(current_epoch, self.config.trainer.total_epochs):
-            for batch_dict in self.train_dataloader:
+            for step_in_epoch, batch_dict in enumerate(self.train_dataloader):
                 if hasattr(self.actor_rollout_wg, "async_calls_finalize_fn_exec"):
                     self.actor_rollout_wg.async_calls_finalize_fn_exec(blocking=False)
                 metrics = {}
@@ -1453,9 +1556,22 @@ class RayPPOTrainer:
                 rollout_n = self.config.actor_rollout_ref.rollout.n
                 ttrl_config = self.config.get("ttrl", {})
                 ttrl_enabled = bool(ttrl_config.get("enable", False))
-                n_samples_per_prompt = int(ttrl_config.get("n_samples_per_prompt", rollout_n))
+                msttrl_config = self.config.get("msttrl", {})
+                msttrl_enabled = bool(msttrl_config.get("enable", False))
+                if ttrl_enabled and msttrl_enabled:
+                    raise ValueError("ttrl.enable and msttrl.enable cannot be enabled at the same time.")
+                if msttrl_enabled and not self.config.actor_rollout_ref.rollout.calculate_log_probs:
+                    raise ValueError("msttrl.enable requires actor_rollout_ref.rollout.calculate_log_probs=True.")
+
+                sample_config = msttrl_config if msttrl_enabled else ttrl_config
+                n_samples_per_prompt = int(sample_config.get("n_samples_per_prompt", rollout_n))
                 n_votes_per_prompt = int(ttrl_config.get("n_votes_per_prompt", rollout_n))
-                gen_repeat_times = n_votes_per_prompt if ttrl_enabled else rollout_n
+                if msttrl_enabled:
+                    gen_repeat_times = n_samples_per_prompt
+                elif ttrl_enabled:
+                    gen_repeat_times = n_votes_per_prompt
+                else:
+                    gen_repeat_times = rollout_n
                 gen_batch_output = gen_batch.repeat(repeat_times=gen_repeat_times, interleave=True)
 
                 if self.config.algorithm.adv_estimator == AdvantageEstimator.REMAX:
@@ -1545,8 +1661,11 @@ class RayPPOTrainer:
                     batch.meta_info["images_seqlens"] = images_seqlens_all
                     with marked_timer("reward", timing_raw, color="yellow"):
                         # compute reward model score
-                        if ttrl_enabled and "rm_scores" not in batch.batch.keys():
-                            batch_reward = self.reward_loop_manager.compute_rm_score(batch)
+                        if (ttrl_enabled or msttrl_enabled) and "rm_scores" not in batch.batch.keys():
+                            reward_manager_name = "msttrl" if msttrl_enabled else None
+                            batch_reward = self.reward_loop_manager.compute_rm_score(
+                                batch, reward_manager_name=reward_manager_name
+                            )
                             batch = batch.union(batch_reward)
                         elif self.use_rm and "rm_scores" not in batch.batch.keys():
                             batch_reward = self._compute_reward_colocate(batch)
@@ -1554,6 +1673,8 @@ class RayPPOTrainer:
 
                         # extract reward_tensor and reward_extra_infos_dict for training
                         reward_tensor, reward_extra_infos_dict = extract_reward(batch)
+                        if msttrl_enabled and step_in_epoch == 0:
+                            self._dump_msttrl_rewards(batch, epoch)
 
                     # Operating Mode Selection:
                     # - Bypass mode: Sets old_log_probs = rollout_log_probs (2 policies: π_rollout, π_θ)
@@ -1784,6 +1905,8 @@ class RayPPOTrainer:
                 self.global_steps += 1
 
                 if is_last_step:
+                    if msttrl_enabled:
+                        self._dump_msttrl_memory_bank(epoch)
                     if hasattr(self.actor_rollout_wg, "async_calls_finalize_fn_exec"):
                         self.actor_rollout_wg.async_calls_finalize_fn_exec(blocking=True)
                     self._shutdown_dump_executor()
@@ -1796,6 +1919,8 @@ class RayPPOTrainer:
                 if hasattr(self.train_dataset, "on_batch_end"):
                     # The dataset may be changed after each training batch
                     self.train_dataset.on_batch_end(batch=batch)
+            if msttrl_enabled:
+                self._dump_msttrl_memory_bank(epoch)
 
         # Ensure dump executor is shut down when training loop ends without reaching is_last_step
         self._shutdown_dump_executor()

@@ -13,6 +13,7 @@
 # limitations under the License.
 
 import asyncio
+import copy
 import logging
 import os
 
@@ -134,25 +135,58 @@ class RewardLoopWorker:
             reward_router_address=self.reward_router_address,
             reward_model_tokenizer=self.reward_model_tokenizer,
         )
+        self.reward_managers = {self.config.reward.reward_manager.name: self.reward_manager}
 
-    async def compute_score_batch(self, data: DataProto) -> list[dict]:
+    def _load_reward_manager(self, reward_manager_name: str):
+        config = copy.deepcopy(self.config)
+        with open_dict(config):
+            config.reward.reward_manager.name = reward_manager_name
+        return load_reward_manager(
+            config,
+            self.input_tokenizer,
+            reward_router_address=self.reward_router_address,
+            reward_model_tokenizer=self.reward_model_tokenizer,
+        )
+
+    def _get_reward_manager(self, reward_manager_name: str | None = None):
+        if reward_manager_name is None:
+            return self.reward_manager
+        if reward_manager_name not in self.reward_managers:
+            self.reward_managers[reward_manager_name] = self._load_reward_manager(reward_manager_name)
+        return self.reward_managers[reward_manager_name]
+
+    async def compute_score_batch(self, data: DataProto, reward_manager_name: str | None = None) -> list[dict]:
+        reward_manager = self._get_reward_manager(reward_manager_name)
+        if hasattr(reward_manager, "run_batch"):
+            outputs = reward_manager.run_batch(data)
+            if asyncio.iscoroutine(outputs):
+                outputs = await outputs
+            return outputs
+
         tasks = []
         for i in range(len(data)):
-            tasks.append(asyncio.create_task(self.compute_score(data[i : i + 1])))
+            tasks.append(asyncio.create_task(self.compute_score(data[i : i + 1], reward_manager_name)))
         outputs = await asyncio.gather(*tasks)
         return outputs
 
-    async def compute_score(self, data: DataProto) -> dict:
+    async def compute_score(self, data: DataProto, reward_manager_name: str | None = None) -> dict:
+        reward_manager = self._get_reward_manager(reward_manager_name)
         if self.config.reward.custom_reward_function.path is not None:
             # directly use user-customized reward function
-            return await self.reward_manager.run_single(data)
+            return await reward_manager.run_single(data)
         else:
             if self.config.reward.reward_model.enable:
                 # we assume the rm is disrm
                 # genrm must set custom_reward_function
                 return await self.compute_score_disrm(data[-1:])
             else:
-                return await self.reward_manager.run_single(data)
+                return await reward_manager.run_single(data)
+
+    def get_reward_manager_state(self, reward_manager_name: str) -> dict:
+        reward_manager = self._get_reward_manager(reward_manager_name)
+        if hasattr(reward_manager, "get_state"):
+            return reward_manager.get_state()
+        return {}
 
     async def _post_request(self, payload: dict, endpoint: str, max_retries: int = 16):
         url = f"http://{self.reward_router_address}/{endpoint}"
@@ -297,6 +331,10 @@ class RewardLoopManager:
         (1) rule-based reward without reward model
         (2) reward model with extra resource pool
         """
+        if self.config.get("msttrl", {}).get("enable", False):
+            return None
+        if not getattr(self.reward_manager_cls, "supports_agent_reward_loop", True):
+            return None
         if not self.config.reward.reward_model.enable or self.config.reward.reward_model.enable_resource_pool:
             return self.reward_loop_workers
         return None
@@ -304,6 +342,11 @@ class RewardLoopManager:
     def _init_reward_loop_workers(self):
         self.reward_loop_workers = []
         num_workers = self.config.reward.num_workers
+        if getattr(self.reward_manager_cls, "requires_single_worker", False) and num_workers != 1:
+            raise ValueError(
+                f"{self.reward_manager_cls.__name__} keeps state across batches and requires reward.num_workers=1, "
+                f"but got {num_workers}."
+            )
         node_ids = [node["NodeID"] for node in ray.nodes() if node["Alive"] and node["Resources"].get("CPU", 0) > 0]
 
         for i in range(num_workers):
@@ -320,14 +363,28 @@ class RewardLoopManager:
                 ).remote(self.config, self.reward_router_address)
             )
 
-    def compute_rm_score(self, data: DataProto) -> DataProto:
+    def _get_reward_manager_cls(self, reward_manager_name: str | None = None):
+        if reward_manager_name is None:
+            return self.reward_manager_cls
+        from verl.experimental.reward_loop.reward_manager import get_reward_manager_cls
+
+        return get_reward_manager_cls(reward_manager_name)
+
+    def compute_rm_score(self, data: DataProto, reward_manager_name: str | None = None) -> DataProto:
         if self.reward_model_manager is not None:
             self.reward_model_manager.wake_up()
+
+        reward_manager_cls = self._get_reward_manager_cls(reward_manager_name)
+        if getattr(reward_manager_cls, "requires_single_worker", False) and len(self.reward_loop_workers) != 1:
+            raise ValueError(
+                f"{reward_manager_cls.__name__} keeps state across batches and requires reward.num_workers=1, "
+                f"but got {len(self.reward_loop_workers)}."
+            )
 
         chunks = data.chunk(len(self.reward_loop_workers))
         outputs = ray.get(
             [
-                worker.compute_score_batch.remote(chunk)
+                worker.compute_score_batch.remote(chunk, reward_manager_name)
                 for worker, chunk in zip(self.reward_loop_workers, chunks, strict=True)
             ]
         )
@@ -335,7 +392,7 @@ class RewardLoopManager:
 
         # compute rm score
         scores = [item["reward_score"] for item in outputs_flat]
-        rm_scores = self.reward_manager_cls.assemble_rm_scores(data, scores)
+        rm_scores = reward_manager_cls.assemble_rm_scores(data, scores)
         batch = TensorDict({"rm_scores": rm_scores}, batch_size=len(data))
 
         reward_extra_infos = [output.get("reward_extra_info", {}) for output in outputs_flat]
@@ -350,6 +407,12 @@ class RewardLoopManager:
         return DataProto(
             batch=batch, non_tensor_batch=non_tensor_batch, meta_info={"reward_extra_keys": reward_extra_keys}
         )
+
+    def get_reward_manager_state(self, reward_manager_name: str) -> dict:
+        states = ray.get(
+            [worker.get_reward_manager_state.remote(reward_manager_name) for worker in self.reward_loop_workers]
+        )
+        return {"reward_manager_name": reward_manager_name, "workers": states}
 
     def _run_all(self, tasks: list[asyncio.Task]):
         async def run_all():

@@ -723,11 +723,16 @@ class PPOTrainer:
             agent_loop_manager_cls = load_class_from_fqn(manager_class_fqn, "AgentLoopManager")
         else:
             agent_loop_manager_cls = AgentLoopManagerTQ
+        reward_loop_worker_handles = self.reward_loop_manager.reward_loop_workers
+        if self.config.get("msttrl", {}).get("enable", False) or not getattr(
+            self.reward_loop_manager.reward_manager_cls, "supports_agent_reward_loop", True
+        ):
+            reward_loop_worker_handles = None
         self.async_rollout_manager = agent_loop_manager_cls.create(
             config=self.config,
             llm_client=self.llm_server_manager.get_client(),
             teacher_client=self.teacher_model_manager.get_client() if self.use_teacher_policy else None,
-            reward_loop_worker_handles=self.reward_loop_manager.reward_loop_workers,
+            reward_loop_worker_handles=reward_loop_worker_handles,
             replay_buffer=self.replay_buffer,
         )
         logger.info("agent loop manager initialized")

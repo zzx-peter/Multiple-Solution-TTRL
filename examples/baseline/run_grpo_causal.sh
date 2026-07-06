@@ -20,7 +20,7 @@ mirco_bacth_size=4
 gpu_memory_utilization=0.5
 offload=True
 
-project_name="mode_collaspe"
+project_name="mode_collapse"
 experiment_name="Qwen3-1.7B-causal-reason"
 seed=1337
 

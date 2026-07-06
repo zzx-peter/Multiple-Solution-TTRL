@@ -17,16 +17,16 @@ from .dapo import DAPORewardManager
 from .gdpo import GDPORewardManager
 from .naive import NaiveRewardManager
 from .limited import RateLimitedRewardManager
+from .multiple_solution_ttrl import MultipleSolutionTTRLRewardManager
 from .remote import RemoteRewardManager
-from .ttrl import TTRLRewardManager
 
 __all__ = [
     "DAPORewardManager",
     "GDPORewardManager",
     "NaiveRewardManager",
     "RateLimitedRewardManager",
+    "MultipleSolutionTTRLRewardManager",
     "RemoteRewardManager",
-    "TTRLRewardManager",
     "register",
     "get_reward_manager_cls",
 ]

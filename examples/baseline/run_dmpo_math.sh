@@ -12,8 +12,8 @@ train_files="['$math_path']"
 test_files="['$math_test_path']"
 
 main_model=/scratch/ophv164/model/Qwen3-1.7B
-project_name="env_test"
-experiment_name="gsm8k-dmpo-smoke"
+project_name="mode_collapse"
+experiment_name="gsm8k-dmpo"
 seed=1337
 
 python3 -m verl.trainer.main_ppo \

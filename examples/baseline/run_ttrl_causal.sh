@@ -20,7 +20,7 @@ mirco_bacth_size=4
 gpu_memory_utilization=0.5
 offload=True
 
-project_name="mode_collaspe"
+project_name="mode_collapse"
 experiment_name="Qwen3-1.7B-causal-reason-ttrl"
 seed=1337
 
@@ -67,7 +67,6 @@ python3 -m verl.trainer.main_ppo \
     algorithm.use_kl_in_reward=False \
     algorithm.kl_ctrl.kl_coef=0.0 \
     reward.num_workers=1 \
-    reward.reward_manager.name=ttrl \
     +ttrl.enable=True \
     trainer.balance_batch=True \
     trainer.critic_warmup=0 \
