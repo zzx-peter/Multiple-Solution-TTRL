@@ -22,8 +22,8 @@ gpu_memory_utilization=0.5
 offload=True
 
 project_name="mode_collapse"
-experiment_name="Qwen3-1.7B-causal-reason-msttrl"
-msttrl_dump_dir="/scratch/ophv164/result/${project_name}/${experiment_name}/msttrl_inspect"
+experiment_name="Qwen3-1.7B-causal-msttrl-v4"
+msttrl_dump_dir="/scratch/ophv164/result/${project_name}/${experiment_name}"
 seed=1337
 
 main_model=/scratch/ophv164/model/Qwen3-1.7B
@@ -72,7 +72,9 @@ python3 -m verl.trainer.main_ppo \
     reward.num_workers=1 \
     +msttrl.enable=True \
     +msttrl.plausibility_alpha=0.0 \
-    +msttrl.novelty_lambda=1.0 \
+    +msttrl.novelty_lambda=0.0 \
+    +msttrl.high_threshold=0.8 \
+    +msttrl.low_threshold=0.25 \
     +msttrl.dump_dir=${msttrl_dump_dir} \
     trainer.balance_batch=True \
     trainer.critic_warmup=0 \

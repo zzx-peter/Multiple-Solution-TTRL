@@ -188,6 +188,38 @@ class RewardLoopWorker:
             return reward_manager.get_state()
         return {}
 
+    def reset_reward_manager_epoch_stats(self, reward_manager_name: str) -> dict:
+        reward_manager = self._get_reward_manager(reward_manager_name)
+        if hasattr(reward_manager, "reset_epoch_stats"):
+            return reward_manager.reset_epoch_stats()
+        return {}
+
+    async def prepare_verification_batch(self, data: DataProto, reward_manager_name: str | None = None) -> dict:
+        reward_manager = self._get_reward_manager(reward_manager_name)
+        if not hasattr(reward_manager, "prepare_verification_batch"):
+            return {}
+        # Optional extension hook for stateful reward managers such as MSTTRL:
+        # the worker turns rollout responses into verifier prompts before the
+        # trainer runs an extra generation pass.
+        result = reward_manager.prepare_verification_batch(data)
+        if asyncio.iscoroutine(result):
+            result = await result
+        return result
+
+    def apply_verification_results(
+        self,
+        prompt_keys: list[str],
+        solution_modes: list[str],
+        verifier_outputs: list[str],
+        reward_manager_name: str | None = None,
+    ) -> dict:
+        reward_manager = self._get_reward_manager(reward_manager_name)
+        if not hasattr(reward_manager, "apply_verification_results"):
+            return {}
+        # Feed decoded verifier generations back into the same reward manager
+        # instance that prepared the batch, so its pending state can be routed.
+        return reward_manager.apply_verification_results(prompt_keys, solution_modes, verifier_outputs)
+
     async def _post_request(self, payload: dict, endpoint: str, max_retries: int = 16):
         url = f"http://{self.reward_router_address}/{endpoint}"
         last_exception = None
@@ -413,6 +445,42 @@ class RewardLoopManager:
             [worker.get_reward_manager_state.remote(reward_manager_name) for worker in self.reward_loop_workers]
         )
         return {"reward_manager_name": reward_manager_name, "workers": states}
+
+    def reset_reward_manager_epoch_stats(self, reward_manager_name: str) -> dict:
+        states = ray.get(
+            [worker.reset_reward_manager_epoch_stats.remote(reward_manager_name) for worker in self.reward_loop_workers]
+        )
+        return {"reward_manager_name": reward_manager_name, "workers": states}
+
+    def prepare_verification_batch(self, data: DataProto, reward_manager_name: str | None = None) -> dict:
+        reward_manager_cls = self._get_reward_manager_cls(reward_manager_name)
+        if getattr(reward_manager_cls, "requires_single_worker", False) and len(self.reward_loop_workers) != 1:
+            raise ValueError(
+                f"{reward_manager_cls.__name__} keeps state across batches and requires reward.num_workers=1, "
+                f"but got {len(self.reward_loop_workers)}."
+            )
+        # Verification preparation mutates pending state, so it must target one
+        # worker deterministically instead of chunking the batch.
+        if len(self.reward_loop_workers) != 1:
+            raise ValueError("Verifier preparation requires reward.num_workers=1.")
+        return ray.get(self.reward_loop_workers[0].prepare_verification_batch.remote(data, reward_manager_name))
+
+    def apply_verification_results(
+        self,
+        prompt_keys: list[str],
+        solution_modes: list[str],
+        verifier_outputs: list[str],
+        reward_manager_name: str | None = None,
+    ) -> dict:
+        # Apply results on the same singleton worker that cached pending rows and
+        # pending modes during prepare_verification_batch().
+        if len(self.reward_loop_workers) != 1:
+            raise ValueError("Verifier result application requires reward.num_workers=1.")
+        return ray.get(
+            self.reward_loop_workers[0].apply_verification_results.remote(
+                prompt_keys, solution_modes, verifier_outputs, reward_manager_name
+            )
+        )
 
     def _run_all(self, tasks: list[asyncio.Task]):
         async def run_all():

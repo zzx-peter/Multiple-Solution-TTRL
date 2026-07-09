@@ -126,7 +126,7 @@ def test_multiple_solution_ttrl_invalid_modes_do_not_enter_memory_bank():
     assert outputs[0]["reward_extra_info"]["msttrl_solution_mode"] == "causal:<invalid>"
     assert outputs[0]["reward_extra_info"]["msttrl_history_count"] == 0.0
     assert outputs[0]["reward_score"] == 0.0
-    assert state["memory_bank"] == []
+    assert state["solution_sets"] == []
     assert state["total_count"] == 0
 
 

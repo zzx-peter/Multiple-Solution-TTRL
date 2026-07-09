@@ -38,11 +38,13 @@ def apply_ttrl_gt(
     gen_batch_output: DataProto,
     n_votes_per_prompt: int,
     tokenizer,
+    num_ans: int = 1,
 ) -> DataProto:
     """Replace ground truth with a majority-vote pseudo label for each prompt."""
     assert len(gen_batch_output) % n_votes_per_prompt == 0, (
         "gen_batch_output length must be divisible by n_votes_per_prompt"
     )
+    assert num_ans >= 1, "num_ans must be >= 1"
     num_prompts = len(gen_batch_output) // n_votes_per_prompt
     assert len(batch) == num_prompts, "batch length must match number of prompt groups"
 
@@ -55,7 +57,7 @@ def apply_ttrl_gt(
         start = prompt_idx * n_votes_per_prompt
         original_gt = batch[prompt_idx].non_tensor_batch["reward_model"]["ground_truth"]
         prompt_outputs = responses[start : start + n_votes_per_prompt]
-        pseudo_gt, majority_key, majority_ratio = _majority_vote_causal(prompt_outputs, original_gt)
+        pseudo_gt, majority_key, majority_ratio = _majority_vote_causal(prompt_outputs, original_gt, num_ans=num_ans)
         majority_gts.append(pseudo_gt)
         majority_keys.append(majority_key)
         majority_ratios.append(majority_ratio)
@@ -85,7 +87,11 @@ def _decode_responses(data: DataProto, tokenizer) -> list[str]:
     return responses
 
 
-def _majority_vote_causal(model_outputs: list[str], original_gt: Any) -> tuple[dict[str, Any], str, float]:
+def _majority_vote_causal(
+    model_outputs: list[str],
+    original_gt: Any,
+    num_ans: int = 1,
+) -> tuple[dict[str, Any], list[str], float]:
     nodes = original_gt.get("nodes") if isinstance(original_gt, dict) else None
     max_edges = original_gt.get("max_edges") if isinstance(original_gt, dict) else None
 
@@ -95,22 +101,25 @@ def _majority_vote_causal(model_outputs: list[str], original_gt: Any) -> tuple[d
         if prediction is not None:
             predictions.append(prediction)
     if not predictions:
-        return _make_causal_ground_truth((), original_gt, empty=True), "", 0.0
+        return _make_causal_ground_truth([], original_gt), [], 0.0
 
-    majority_edges, majority_count = Counter(predictions).most_common(1)[0]
-    majority_ratio = majority_count / len(model_outputs)
+    top_predictions = Counter(predictions).most_common(num_ans)
+    majority_ratio = top_predictions[0][1] / len(model_outputs)
+    majority_edges_list = [edges for edges, _ in top_predictions]
     return (
-        _make_causal_ground_truth(majority_edges, original_gt),
-        _graph_key(majority_edges),
+        _make_causal_ground_truth(majority_edges_list, original_gt),
+        [_graph_key(edges) for edges in majority_edges_list],
         majority_ratio,
     )
 
 
 def _make_causal_ground_truth(
-    edges: tuple[tuple[str, str], ...],
+    edges_list: list[tuple[tuple[str, str], ...]],
     original_gt: Any,
-    empty: bool = False,
 ) -> dict[str, Any]:
     pseudo_gt = dict(original_gt) if isinstance(original_gt, dict) else {}
-    pseudo_gt["ground_truth_list"] = [] if empty else [{"edges": [[src, dst] for src, dst in edges]}]
+    pseudo_gt["ground_truth_list"] = [
+        {"edges": [[src, dst] for src, dst in edges]}
+        for edges in edges_list
+    ]
     return pseudo_gt

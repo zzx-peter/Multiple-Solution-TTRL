@@ -1007,10 +1007,12 @@ class AgentLoopWorker:
 
         # Only include reward_extra_keys in meta_info if rm_scores is in batch
         # This avoids conflicts when reward_tensor is merged later in ray_trainer.py
+        # Preserve validate so stateful reward managers can score validation
+        # rollouts without mutating their training-time memory.
         if "rm_scores" in batch.keys():
-            meta_info = {"metrics": metrics, "reward_extra_keys": reward_extra_keys}
+            meta_info = {"metrics": metrics, "reward_extra_keys": reward_extra_keys, "validate": validate}
         else:
-            meta_info = {"metrics": metrics}
+            meta_info = {"metrics": metrics, "validate": validate}
 
         return DataProto(
             batch=batch,
