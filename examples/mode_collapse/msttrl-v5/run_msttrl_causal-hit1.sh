@@ -22,7 +22,7 @@ gpu_memory_utilization=0.5
 offload=True
 
 project_name="mode_collapse"
-experiment_name="Qwen3-1.7B-causal-msttrl-v4"
+experiment_name="Qwen3-1.7B-causal-msttrl-v5-hit1"
 msttrl_dump_dir="/scratch/ophv164/result/${project_name}/${experiment_name}"
 seed=1337
 
@@ -71,10 +71,9 @@ python3 -m verl.trainer.main_ppo \
     algorithm.kl_ctrl.kl_coef=0.0 \
     reward.num_workers=1 \
     +msttrl.enable=True \
-    +msttrl.plausibility_alpha=0.0 \
-    +msttrl.novelty_lambda=0.0 \
     +msttrl.high_threshold=0.8 \
-    +msttrl.low_threshold=0.25 \
+    +msttrl.low_threshold=0.5 \
+    +msttrl.correct_set_hit_window=1 \
     +msttrl.dump_dir=${msttrl_dump_dir} \
     trainer.balance_batch=True \
     trainer.critic_warmup=0 \
