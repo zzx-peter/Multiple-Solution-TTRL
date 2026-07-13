@@ -1158,9 +1158,12 @@ class PPOTrainer:
             for var_name, metric2val in var2metric2val.items():
                 n_max = max([int(name.split("@")[-1].split("/")[0]) for name in metric2val.keys()])
                 for metric_name, metric_val in metric2val.items():
-                    is_causal_recovery = data_source in ("causal", "causel") and var_name == "causal_recovery"
+                    is_causal_core_metric = data_source == "causal" and var_name in (
+                        "causal_recovery",
+                        "mode_recovery_rate",
+                    )
                     if (
-                        (var_name == core_var or is_causal_recovery)
+                        (var_name == core_var or is_causal_core_metric)
                         and any(metric_name.startswith(pfx) for pfx in ["mean", "maj", "best", "recovery"])
                         and (f"@{n_max}" in metric_name)
                     ):

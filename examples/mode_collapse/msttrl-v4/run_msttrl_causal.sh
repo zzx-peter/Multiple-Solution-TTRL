@@ -22,7 +22,7 @@ gpu_memory_utilization=0.5
 offload=True
 
 project_name="mode_collapse"
-experiment_name="Qwen3-1.7B-causal-msttrl-v4-copy"
+experiment_name="Qwen3-1.7B-causal-msttrl-v4"
 msttrl_dump_dir="/scratch/ophv164/result/${project_name}/${experiment_name}"
 seed=1337
 

@@ -553,13 +553,25 @@ def calc_maj_val(data: list[dict[str, Any]], vote_key: str, val_key: str) -> flo
 
 def calc_causal_recovery(data: list[dict[str, Any]]) -> float:
     """Calculate HypoSpace Recovery from sampled causal predictions."""
+    recovered_count, n_ground_truths = calc_causal_recovery_counts(data)
+    return recovered_count / n_ground_truths if n_ground_truths > 0 else 0.0
+
+
+def calc_causal_recovery_counts(data: list[dict[str, Any]]) -> tuple[int, int]:
+    """Return the number of recovered modes and total modes for one prompt."""
     n_ground_truths = 0
     recovered = set()
     for item in data:
         n_ground_truths = max(n_ground_truths, int(item.get("n_ground_truths") or 0))
         if item.get("valid") and item.get("pred"):
             recovered.add(item["pred"])
-    return len(recovered) / n_ground_truths if n_ground_truths > 0 else 0.0
+    return len(recovered), n_ground_truths
+
+
+def calc_causal_recovered_count(data: list[dict[str, Any]]) -> float:
+    """Return only the recovered mode count for bootstrap aggregation."""
+    recovered_count, _ = calc_causal_recovery_counts(data)
+    return float(recovered_count)
 
 
 def process_validation_metrics(
@@ -635,6 +647,7 @@ def process_validation_metrics(
 
     # 3. cache metric results
     data_src2uid2var2metric = {}
+    data_src2mode_recovery_parts = defaultdict(lambda: defaultdict(list))
 
     # 4. flatten loop
     for data_source, uid2var2vals in data_src2uid2var2vals.items():
@@ -661,7 +674,11 @@ def process_validation_metrics(
                     )
                 ]
                 n_resps = len(recovery_data)
+                recovered_count, n_ground_truths = calc_causal_recovery_counts(recovery_data)
                 recovery_metric = {f"mean@{n_resps}": calc_causal_recovery(recovery_data)}
+                data_src2mode_recovery_parts[data_source][f"mean@{n_resps}"].append(
+                    (float(recovered_count), float(n_ground_truths))
+                )
                 if n_resps > 1:
                     if n_resps not in ns_cache:
                         ns_cache[n_resps] = gen_ns(n_resps)
@@ -675,6 +692,16 @@ def process_validation_metrics(
                         )
                         recovery_metric[f"recovery@{n}/mean"] = recovery_mean
                         recovery_metric[f"recovery@{n}/std"] = recovery_std
+                        [(recovered_mean, _)] = bootstrap_metric(
+                            data=recovery_data,
+                            subset_size=n,
+                            reduce_fns=[calc_causal_recovered_count],
+                            n_bootstrap=n_bootstrap,
+                            seed=seed,
+                        )
+                        data_src2mode_recovery_parts[data_source][f"recovery@{n}/mean"].append(
+                            (recovered_mean, float(n_ground_truths))
+                        )
                 var_dict["causal_recovery"] = recovery_metric
 
             for var_name, var_vals in var2vals.items():
@@ -741,4 +768,11 @@ def process_validation_metrics(
         for var_name, metric2uid_vals in var2metric2uid_vals.items():
             for metric_name, uid_vals in metric2uid_vals.items():
                 data_src2var2metric2val[data_source][var_name][metric_name] = np.mean(uid_vals)
+    for data_source, metric2parts in data_src2mode_recovery_parts.items():
+        for metric_name, parts in metric2parts.items():
+            total_recovered = sum(recovered for recovered, _ in parts)
+            total_modes = sum(n_modes for _, n_modes in parts)
+            data_src2var2metric2val[data_source]["mode_recovery_rate"][metric_name] = (
+                total_recovered / total_modes if total_modes > 0 else 0.0
+            )
     return data_src2var2metric2val

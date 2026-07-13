@@ -28,6 +28,7 @@ main_model=/scratch/ophv164/model/Qwen3-1.7B
 
 python3 -m verl.trainer.main_ppo \
     algorithm.adv_estimator=ips_grpo \
+    algorithm.norm_adv_by_std_in_grpo=False \
     actor_rollout_ref.actor.policy_loss.loss_mode=vanilla \
     data.train_files="${train_files}" \
     data.val_files="${test_files}" \
@@ -42,11 +43,9 @@ python3 -m verl.trainer.main_ppo \
     actor_rollout_ref.model.path=${main_model} \
     actor_rollout_ref.actor.optim.lr=1e-6 \
     actor_rollout_ref.model.use_remove_padding=True \
-    actor_rollout_ref.actor.ppo_mini_batch_size=16 \
+    actor_rollout_ref.actor.ppo_mini_batch_size=8 \
     actor_rollout_ref.actor.ppo_micro_batch_size_per_gpu=${mirco_bacth_size} \
-    actor_rollout_ref.actor.use_kl_loss=True \
-    actor_rollout_ref.actor.kl_loss_coef=0.001 \
-    actor_rollout_ref.actor.kl_loss_type=low_var_kl \
+    actor_rollout_ref.actor.use_kl_loss=False \
     actor_rollout_ref.actor.entropy_coeff=0 \
     actor_rollout_ref.actor.grad_clip=1.0 \
     actor_rollout_ref.model.enable_gradient_checkpointing=True \

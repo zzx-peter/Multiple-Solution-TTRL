@@ -640,6 +640,8 @@ class RayPPOTrainer:
             "total_correct": data.get("total_correct", 0),
             "total_candidate": data.get("total_candidate", 0),
             "total_wrong": data.get("total_wrong", 0),
+            "verifier_correct_set_accuracy": data.get("verifier_correct_set_accuracy", {}),
+            "verifier_example": data.get("verifier_example"),
             "solution_sets": data.get("solution_sets", []),
         }
         filename = os.path.join(root_dump_dir, "solution_sets", f"epoch_{epoch}.json")
@@ -946,9 +948,12 @@ class RayPPOTrainer:
             for var_name, metric2val in var2metric2val.items():
                 n_max = max([int(name.split("@")[-1].split("/")[0]) for name in metric2val.keys()])
                 for metric_name, metric_val in metric2val.items():
-                    is_causal_recovery = data_source in ("causal", "causel") and var_name == "causal_recovery"
+                    is_causal_core_metric = data_source == "causal" and var_name in (
+                        "causal_recovery",
+                        "mode_recovery_rate",
+                    )
                     if (
-                        (var_name == core_var or is_causal_recovery)
+                        (var_name == core_var or is_causal_core_metric)
                         and any(metric_name.startswith(pfx) for pfx in ["mean", "maj", "best", "recovery"])
                         and (f"@{n_max}" in metric_name)
                     ):

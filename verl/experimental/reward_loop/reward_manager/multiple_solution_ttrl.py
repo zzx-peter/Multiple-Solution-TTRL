@@ -18,19 +18,38 @@ from verl.experimental.reward_loop.reward_manager import register
 from verl.experimental.reward_loop.reward_manager.base import RewardManagerBase
 from verl.utils.reward_score import default_compute_score
 
-VERIFIER_SYSTEM_PROMPT = "You are a rigorous verifier for multiple-solution reasoning tasks."
+VERIFIER_SYSTEM_PROMPT = "You are a rigorous verifier for causal-graph candidates."
 
 # The parser below looks for a "Verification Result" line, so keep the verifier
 # prompt explicit and stable across sampled verification attempts.
-VERIFIER_USER_TEMPLATE = """Problem:
-{problem}
+VERIFIER_USER_TEMPLATE = """Verify whether the candidate causal graph explains the perturbation observations.
 
-Candidate solution mode:
+Semantics:
+- When a node is perturbed, the perturbed node is 0.
+- A node is 1 if it is a downstream descendant of the perturbed node in the causal graph.
+- All other nodes are 0.
+
+Nodes: A, B, C, D
+
+Constraint: The graph should have at most 6 edges.
+
+Reasoning example:
+An edge `X->Y` points from the upstream cause X to the downstream effect Y.
+Follow arrows only in this left-to-right direction; do not reverse an edge.
+For candidate graph `A->B, B->D`, B and D are descendants of A, while C is not.
+Therefore, perturbing A gives A:0, B:1, C:0, D:1, so
+`Perturb(A) -> A:0 B:1 C:0 D:1` is consistent. In contrast,
+`Perturb(A) -> A:0 B:0 C:0 D:1` is inconsistent because B is reachable from A.
+
+Perturbation observations:
+{observations}
+
+Candidate graph:
 {candidate}
 
-Verify whether the candidate solution mode satisfies all problem constraints and explains all observations in the problem. A problem may have multiple valid solution modes, so judge only this candidate instead of looking for a unique answer.
+Reason through reachability for every listed perturbation. Judge only this candidate; multiple candidates may be valid.
 
-First provide a brief reasoning paragraph that explicitly checks the candidate against the listed nodes, graph constraints, and observations. Then end your response with exactly one line:
+First provide a reasoning paragraph. Then end your response with exactly one line:
 Verification Result: True
 or
 Verification Result: False
@@ -86,6 +105,9 @@ class MultipleSolutionTTRLRewardManager(RewardManagerBase):
             int(config.data.max_prompt_length),
             int(config.actor_rollout_ref.rollout.prompt_length),
         )
+        # Keep verifier prompt formatting aligned with actor rollout prompts,
+        # e.g. Qwen3's `enable_thinking=False`.
+        self.apply_chat_template_kwargs = dict(config.data.get("apply_chat_template_kwargs", {}))
         if self.low_threshold > self.high_threshold:
             raise ValueError("msttrl.low_threshold must be <= msttrl.high_threshold.")
         # Counts how often each prompt emits each valid solution mode across
@@ -116,6 +138,12 @@ class MultipleSolutionTTRLRewardManager(RewardManagerBase):
         self.pending_rows: list[dict[str, Any]] | None = None
         self.pending_verify_modes: dict[str, list[str]] = {}
         self.pending_scores: dict[tuple[str, str], float] = {}
+        self.pending_verifier_prompts: list[list[dict[str, str]]] = []
+        # Epoch-level debug data for modes that verifier routing places into
+        # correct_set, plus one concrete verifier request/response example.
+        self.epoch_verifier_correct_count = 0
+        self.epoch_verifier_correct_ground_truth_count = 0
+        self.epoch_verifier_example: dict[str, Any] | None = None
 
     async def run_batch(self, data: DataProto) -> list[dict[str, Any]]:
         # During normal MSTTRL training the verifier path prepares rows first.
@@ -163,6 +191,7 @@ class MultipleSolutionTTRLRewardManager(RewardManagerBase):
                     prompts.append(messages)
                     prompt_keys.append(prompt_key)
                     solution_modes.append(mode)
+        self.pending_verifier_prompts = prompts
 
         return {
             "batch": self._build_generation_batch(prompts),
@@ -206,6 +235,18 @@ class MultipleSolutionTTRLRewardManager(RewardManagerBase):
             self.pending_scores[key] = true_votes / len(results) if results else 0.0
             prompt_key, solution_mode = key
             self.plausibility_bank[prompt_key][solution_mode] = self.pending_scores[key]
+
+        if self.epoch_verifier_example is None and verifier_outputs:
+            first_prompt = self.pending_verifier_prompts[0] if self.pending_verifier_prompts else []
+            first_key = (prompt_keys[0], solution_modes[0])
+            self.epoch_verifier_example = {
+                "prompt_key": prompt_keys[0],
+                "solution_mode": solution_modes[0],
+                "verifier_prompt": first_prompt,
+                "verifier_output": verifier_outputs[0],
+                "parsed_result": self._parse_verification_result(verifier_outputs[0]),
+                "pass_rate": self.pending_scores.get(first_key),
+            }
 
         # Modes with no parsed votes are absent from pending_scores. MSTTRL routes
         # them as score 0.0; verifier-only reward reads the same default directly.
@@ -301,7 +342,7 @@ class MultipleSolutionTTRLRewardManager(RewardManagerBase):
         for prompt_key, reward_sum in reward_sums.items():
             prev_sum = self.last_reward_sum.get(prompt_key)
             self.last_reward_sum[prompt_key] = reward_sum
-            if prev_sum is None or reward_sum < prev_sum:
+            if prev_sum is None:
                 continue
             self._reconsider_boundary_modes(prompt_key)
 
@@ -359,6 +400,10 @@ class MultipleSolutionTTRLRewardManager(RewardManagerBase):
                 if score >= self.high_threshold:
                     sets[SET_CORRECT].add(mode)
                     sets[SET_WRONG].discard(mode)
+                    self.epoch_verifier_correct_count += 1
+                    self.epoch_verifier_correct_ground_truth_count += int(
+                        self._is_ground_truth_mode(prompt_key, mode)
+                    )
                 elif score <= self.low_threshold:
                     sets[SET_WRONG].add(mode)
                     sets[SET_CORRECT].discard(mode)
@@ -425,11 +470,24 @@ class MultipleSolutionTTRLRewardManager(RewardManagerBase):
             "total_correct": sum(item["num_correct"] for item in solution_sets),
             "total_candidate": sum(item["num_candidate"] for item in solution_sets),
             "total_wrong": sum(item["num_wrong"] for item in solution_sets),
+            "verifier_correct_set_accuracy": {
+                "num_modes": self.epoch_verifier_correct_count,
+                "num_ground_truth_modes": self.epoch_verifier_correct_ground_truth_count,
+                "accuracy": (
+                    self.epoch_verifier_correct_ground_truth_count / self.epoch_verifier_correct_count
+                    if self.epoch_verifier_correct_count
+                    else None
+                ),
+            },
+            "verifier_example": self.epoch_verifier_example,
         }
 
     def reset_epoch_stats(self) -> dict[str, Any]:
         self.valid_mode_count_bank.clear()
         self.verified_mode_count_bank.clear()
+        self.epoch_verifier_correct_count = 0
+        self.epoch_verifier_correct_ground_truth_count = 0
+        self.epoch_verifier_example = None
         return {}
 
     def _set_rows(self, prompt_key: str, set_name: str) -> list[dict[str, Any]]:
@@ -597,7 +655,12 @@ class MultipleSolutionTTRLRewardManager(RewardManagerBase):
         for prompt in raw_prompts:
             try:
                 # Prefer model-native chat formatting for verifier prompts.
-                ids = self.tokenizer.apply_chat_template(prompt, tokenize=True, add_generation_prompt=True)
+                ids = self.tokenizer.apply_chat_template(
+                    prompt,
+                    tokenize=True,
+                    add_generation_prompt=True,
+                    **self.apply_chat_template_kwargs,
+                )
             except Exception:
                 # Some tokenizers do not expose chat templates; fall back to a
                 # plain role-prefixed prompt that the rollout backend can still sample.
@@ -639,14 +702,15 @@ class MultipleSolutionTTRLRewardManager(RewardManagerBase):
         )
 
     def _verification_messages(self, prompt_text: str, solution_mode: str) -> list[dict[str, str]]:
-        # Limit very long problems so verifier prompts fit inside the rollout
-        # prompt budget while keeping the candidate mode unchanged.
-        prompt_text = prompt_text[-VERIFIER_MAX_PROBLEM_CHARS:]
+        observations = self._extract_observations(prompt_text[-VERIFIER_MAX_PROBLEM_CHARS:])
         return [
             {"role": "system", "content": VERIFIER_SYSTEM_PROMPT},
             {
                 "role": "user",
-                "content": VERIFIER_USER_TEMPLATE.format(problem=prompt_text, candidate=solution_mode),
+                "content": VERIFIER_USER_TEMPLATE.format(
+                    observations="\n".join(observations) if observations else "No observations found.",
+                    candidate=solution_mode,
+                ),
             },
         ]
 

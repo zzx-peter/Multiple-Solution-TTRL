@@ -558,6 +558,24 @@ class TestProcessValidationMetrics(unittest.TestCase):
         self.assertIn("causal_recovery", result["causal"])
         self.assertAlmostEqual(result["causal"]["causal_recovery"]["mean@4"], 0.5)
         self.assertIn("recovery@4/mean", result["causal"]["causal_recovery"])
+        self.assertIn("mode_recovery_rate", result["causal"])
+        self.assertAlmostEqual(result["causal"]["mode_recovery_rate"]["mean@4"], 0.5)
+
+    def test_process_validation_metrics_causal_mode_recovery_rate(self):
+        """Test global mode recovery is weighted by number of ground-truth modes."""
+        data_sources = ["causal", "causal", "causal", "causal"]
+        sample_inputs = ["prompt1", "prompt1", "prompt2", "prompt2"]
+        infos_dict = {
+            "acc": [1.0, 1.0, 1.0, 1.0],
+            "causal_pred": ["A->B", "A->B", "B->C", "B->C"],
+            "causal_valid": [1.0, 1.0, 1.0, 1.0],
+            "causal_n_ground_truths": [1, 1, 16, 16],
+        }
+
+        result = process_validation_metrics(data_sources, sample_inputs, infos_dict, seed=42)
+
+        self.assertAlmostEqual(result["causal"]["causal_recovery"]["mean@2"], (1.0 + 1.0 / 16.0) / 2.0)
+        self.assertAlmostEqual(result["causal"]["mode_recovery_rate"]["mean@2"], 2.0 / 17.0)
 
 
 if __name__ == "__main__":
