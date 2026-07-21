@@ -88,6 +88,7 @@ class AdvantageEstimator(str, Enum):
     GAE = "gae"
     GRPO = "grpo"
     IPS_GRPO = "ips_grpo"
+    GATED_IPS_GRPO = "gated_ips_grpo"
     REINFORCE_PLUS_PLUS = "reinforce_plus_plus"
     REINFORCE_PLUS_PLUS_BASELINE = "reinforce_plus_plus_baseline"
     REMAX = "remax"
@@ -430,6 +431,120 @@ def compute_ips_grpo_outcome_advantage(
             traj_count = id2traj_count[group_id][id2traj_key[i]]
             traj_prob = max(traj_count / group_size, prob_floor)
             scaled_scores[i] = scores[i] / traj_prob
+
+        id2score = defaultdict(list)
+        for i in range(bsz):
+            id2score[index[i]].append(scaled_scores[i])
+
+        id2mean, id2std = {}, {}
+        for idx, group_scores in id2score.items():
+            if len(group_scores) == 1:
+                id2mean[idx] = scaled_scores.new_tensor(0.0)
+                id2std[idx] = scaled_scores.new_tensor(1.0)
+            else:
+                scores_tensor = torch.stack(group_scores)
+                id2mean[idx] = scores_tensor.mean()
+                id2std[idx] = scores_tensor.std()
+
+        for i in range(bsz):
+            if norm_adv_by_std_in_grpo:
+                scaled_scores[i] = (scaled_scores[i] - id2mean[index[i]]) / (id2std[index[i]] + epsilon)
+            else:
+                scaled_scores[i] = scaled_scores[i] - id2mean[index[i]]
+
+        advantages = scaled_scores.unsqueeze(-1) * response_mask
+    return advantages, advantages
+
+
+@register_adv_est(AdvantageEstimator.GATED_IPS_GRPO)
+def compute_gated_ips_grpo_outcome_advantage(
+    token_level_rewards: torch.Tensor,
+    response_mask: torch.Tensor,
+    index: np.ndarray,
+    responses: Optional[torch.Tensor] = None,
+    non_tensor_batch: Optional[dict] = None,
+    epsilon: float = 1e-6,
+    norm_adv_by_std_in_grpo: bool = True,
+    config: Optional[AlgoConfig] = None,
+    **kwargs,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """
+    Gated IPS-GRPO for MSTTRL.
+
+    Same as IPS-GRPO except responses with outcome reward exactly 1.0 (correct-set
+    modes) use (1 - lambda) / prob instead of reward / prob.
+    """
+    with torch.no_grad():
+        scores = token_level_rewards.sum(dim=-1)
+        scaled_scores = scores.clone()
+        prob_floor = config.get("ips_grpo_prob_clip_epsilon", epsilon) if config is not None else epsilon
+        answer_key = config.get("ips_grpo_answer_key", None) if config is not None else None
+        answer_key_candidates = [answer_key, "causal_pred", "pred"] if answer_key else ["causal_pred", "pred"]
+        debug_print_answers = config.get("ips_grpo_debug_print_answers", True) if config is not None else True
+        debug_answer_max_chars = config.get("ips_grpo_debug_answer_max_chars", 200) if config is not None else 200
+        gated_lambda = config.get("gated_ips_grpo_lambda", 0.5) if config is not None else 0.5
+        reward_match_tolerance = (
+            config.get("gated_ips_grpo_reward_match_tolerance", 1e-6) if config is not None else 1e-6
+        )
+
+        final_answers = None
+        final_answer_field = None
+        if non_tensor_batch is not None:
+            for key in answer_key_candidates:
+                if key in non_tensor_batch:
+                    values = non_tensor_batch[key]
+                    if len(values) == scores.shape[0]:
+                        final_answers = values
+                        final_answer_field = key
+                        break
+
+        id2traj_count = defaultdict(lambda: defaultdict(int))
+        id2traj_key = {}
+        bsz = scores.shape[0]
+
+        for i in range(bsz):
+            if final_answers is not None:
+                answer = final_answers[i]
+                if isinstance(answer, np.generic):
+                    answer = answer.item()
+                traj_key = (final_answer_field, str(answer))
+            elif responses is None:
+                traj_key = (float(scores[i].detach().cpu()),)
+            else:
+                traj_key = tuple(responses[i][response_mask[i].bool()].detach().cpu().tolist())
+            group_id = index[i]
+            id2traj_key[i] = traj_key
+            id2traj_count[group_id][traj_key] += 1
+
+        if debug_print_answers:
+            count_key_name = final_answer_field or "raw_response_tokens"
+            print(f"[IPS-GRPO debug] count_key={count_key_name} prob_floor={prob_floor}")
+            for group_id, traj_counts in id2traj_count.items():
+                group_size = sum(traj_counts.values())
+                print(f"[IPS-GRPO debug] uid={group_id} group_size={group_size}")
+                for traj_key, traj_count in sorted(traj_counts.items(), key=lambda item: (-item[1], str(item[0]))):
+                    traj_prob = traj_count / group_size
+                    clipped_prob = max(traj_prob, prob_floor)
+                    if final_answers is not None:
+                        answer_text = traj_key[1]
+                    else:
+                        answer_text = f"<{count_key_name}: len={len(traj_key)}>"
+                    if len(answer_text) > debug_answer_max_chars:
+                        answer_text = answer_text[:debug_answer_max_chars] + "..."
+                    print(
+                        "[IPS-GRPO debug] "
+                        f"answer={answer_text!r} count={traj_count} prob={traj_prob:.6f} clipped_prob={clipped_prob:.6f}"
+                    )
+
+        for i in range(bsz):
+            group_id = index[i]
+            group_size = sum(id2traj_count[group_id].values())
+            traj_count = id2traj_count[group_id][id2traj_key[i]]
+            traj_prob = max(traj_count / group_size, prob_floor)
+            if abs(float(scores[i]) - 1.0) <= reward_match_tolerance:
+                scaled_scores[i] = (1.0 - gated_lambda) / traj_prob
+            else:
+                scaled_scores[i] = scores[i] / traj_prob
 
         id2score = defaultdict(list)
         for i in range(bsz):

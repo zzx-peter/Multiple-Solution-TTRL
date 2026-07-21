@@ -141,8 +141,10 @@ def compute_advantage_for_multi_trajectories(
     if adv_estimator not in (
         core_algos.AdvantageEstimator.GRPO,
         core_algos.AdvantageEstimator.IPS_GRPO,
+        core_algos.AdvantageEstimator.GATED_IPS_GRPO,
         "grpo",
         "ips_grpo",
+        "gated_ips_grpo",
     ):
         return compute_advantage(
             data,
@@ -1419,7 +1421,12 @@ class PPOTrainer:
     def _compute_advantage(self, batch: KVBatchMeta, metrics: dict) -> KVBatchMeta:
         """Compute the advantage of the batch."""
         fields = ["uid", "response_mask", "rm_scores", "rollout_log_probs", "old_log_probs", "ref_log_prob", "values"]
-        if self.config.algorithm.adv_estimator in (core_algos.AdvantageEstimator.IPS_GRPO, "ips_grpo"):
+        if self.config.algorithm.adv_estimator in (
+            core_algos.AdvantageEstimator.IPS_GRPO,
+            "ips_grpo",
+            core_algos.AdvantageEstimator.GATED_IPS_GRPO,
+            "gated_ips_grpo",
+        ):
             fields.append("responses")
         if self.config.algorithm.adv_estimator == core_algos.AdvantageEstimator.REMAX:
             fields.append("reward_baselines")

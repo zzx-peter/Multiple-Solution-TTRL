@@ -21,14 +21,14 @@ gpu_memory_utilization=0.5
 offload=True
 
 project_name="mode_collapse"
-experiment_name="Qwen3-1.7B-causal-reason-ttrl"
+experiment_name="Qwen3-1.7B-causal-reason-ips-ttrl4"
 seed=1337
 
 main_model=/scratch/ophv164/model/Qwen3-1.7B
 
 python3 -m verl.trainer.main_ppo \
-    algorithm.adv_estimator=grpo \
-    algorithm.norm_adv_by_std_in_grpo=False \
+    algorithm.adv_estimator=ips_grpo \
+    algorithm.norm_adv_by_std_in_grpo=True \
     actor_rollout_ref.actor.policy_loss.loss_mode=vanilla \
     data.train_files="${train_files}" \
     data.val_files="${test_files}" \
@@ -68,6 +68,7 @@ python3 -m verl.trainer.main_ppo \
     algorithm.kl_ctrl.kl_coef=0.0 \
     reward.num_workers=1 \
     +ttrl.enable=True \
+    +ttrl.num_ans=4 \
     trainer.balance_batch=True \
     trainer.critic_warmup=0 \
     trainer.logger='["tensorboard","wandb"]' \

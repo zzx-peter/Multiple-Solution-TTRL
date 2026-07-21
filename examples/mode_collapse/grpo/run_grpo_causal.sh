@@ -21,14 +21,14 @@ gpu_memory_utilization=0.5
 offload=True
 
 project_name="mode_collapse"
-experiment_name="Qwen3-1.7B-causal-reason-grpo"
+experiment_name="Qwen3-1.7B-causal-reason-grpo-norm"
 seed=1337
 
 main_model=/scratch/ophv164/model/Qwen3-1.7B
 
 python3 -m verl.trainer.main_ppo \
     algorithm.adv_estimator=grpo \
-    algorithm.norm_adv_by_std_in_grpo=False \
+    algorithm.norm_adv_by_std_in_grpo=True \
     actor_rollout_ref.actor.policy_loss.loss_mode=vanilla \
     data.train_files="${train_files}" \
     data.val_files="${test_files}" \

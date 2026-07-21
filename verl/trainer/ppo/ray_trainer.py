@@ -259,7 +259,7 @@ def compute_advantage(
         if adv_estimator in (AdvantageEstimator.GDPO, "gdpo"):
             adv_kwargs["non_tensor_batch"] = data.non_tensor_batch
             adv_kwargs["batch"] = data.batch
-        if adv_estimator in (AdvantageEstimator.IPS_GRPO, "ips_grpo"):
+        if adv_estimator in (AdvantageEstimator.IPS_GRPO, "ips_grpo", AdvantageEstimator.GATED_IPS_GRPO, "gated_ips_grpo"):
             adv_kwargs["norm_adv_by_std_in_grpo"] = norm_adv_by_std_in_grpo
             adv_kwargs["non_tensor_batch"] = data.non_tensor_batch
             if "responses" in data.batch:
@@ -1676,6 +1676,10 @@ class RayPPOTrainer:
                 ttrl_enabled = bool(ttrl_config.get("enable", False))
                 msttrl_config = self.config.get("msttrl", {})
                 msttrl_enabled = bool(msttrl_config.get("enable", False))
+                if msttrl_enabled and self.reward_loop_manager is not None:
+                    inject_prior = bool(msttrl_config.get("inject_prior_predictions", True))
+                    if inject_prior:
+                        gen_batch = self.reward_loop_manager.inject_msttrl_prior_predictions(gen_batch)
                 if ttrl_enabled and msttrl_enabled:
                     raise ValueError("ttrl.enable and msttrl.enable cannot be enabled at the same time.")
                 if msttrl_enabled and not self.config.actor_rollout_ref.rollout.calculate_log_probs:

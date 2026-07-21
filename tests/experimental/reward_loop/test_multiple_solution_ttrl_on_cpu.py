@@ -10,6 +10,7 @@ from tensordict import TensorDict
 from verl import DataProto
 from verl.experimental.reward_loop.reward_manager.multiple_solution_ttrl import (
     MultipleSolutionTTRLRewardManager,
+    SET_CORRECT,
 )
 
 
@@ -146,3 +147,45 @@ def test_multiple_solution_ttrl_run_single_allows_agent_loop_placeholder():
 
     output = asyncio.run(manager.run_single(data))
     assert output == {"reward_score": 0.0, "reward_extra_info": {}}
+
+
+def test_msttrl_prior_block_from_correct_set():
+    manager = _make_manager()
+    observations = ["Perturb(A) -> A:0 B:1"]
+    prompt_key = manager._prompt_key_from_observations(observations)
+    manager.solution_sets[prompt_key][SET_CORRECT] = {"causal:A->B", "causal:C->D"}
+    prior = manager.prior_block_for_observations(observations)
+    assert prior == "Graph: A->B\nGraph: C->D"
+
+
+def test_msttrl_inject_prior_into_prompt_text():
+    manager = _make_manager()
+    observations = ["Perturb(A) -> A:0 B:1"]
+    prompt_key = manager._prompt_key_from_observations(observations)
+    manager.solution_sets[prompt_key][SET_CORRECT] = {"causal:A->B"}
+
+    base_prompt = """
+    Observations:
+    Perturb(A) -> A:0 B:1
+
+    Task:
+    Output a graph.
+    """.strip()
+    updated = manager.inject_prior_into_messages([{"role": "user", "content": base_prompt}])[0]["content"]
+    assert "Prior predictions (do not repeat if avoidable):" in updated
+    assert "Graph: A->B" in updated
+    assert updated.index("Graph: A->B") < updated.index("Task:")
+
+
+def test_msttrl_prior_defaults_to_none_for_unknown_prompt():
+    manager = _make_manager()
+    base_prompt = """
+    Observations:
+    Perturb(A) -> A:0 B:1
+
+    Task:
+    Output a graph.
+    """.strip()
+    updated = manager.inject_prior_into_messages([{"role": "user", "content": base_prompt}])[0]["content"]
+    assert "Prior predictions (do not repeat if avoidable):" in updated
+    assert "None" in updated

@@ -3,6 +3,7 @@
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
 
+import copy
 import hashlib
 import inspect
 import re
@@ -59,6 +60,11 @@ SET_CORRECT = "correct"
 SET_CANDIDATE = "candidate"
 SET_WRONG = "wrong"
 VERIFIER_MAX_PROBLEM_CHARS = 2048
+PRIOR_SECTION_HEADER = "Prior predictions (do not repeat if avoidable):"
+PRIOR_SECTION_PATTERN = re.compile(
+    r"\n\s*Prior predictions \(do not repeat if avoidable\):\s*\n.*?(?=\n\s*Task:|\n\s*Diversity rule:|\Z)",
+    flags=re.DOTALL | re.IGNORECASE,
+)
 
 
 def _read_cfg(config, key: str, default: Any) -> Any:
@@ -101,6 +107,7 @@ class MultipleSolutionTTRLRewardManager(RewardManagerBase):
         self.verifier_n = int(_read_cfg(config, "verifier_n", 4))
         self.high_threshold = float(_read_cfg(config, "high_threshold", 0.75))
         self.low_threshold = float(_read_cfg(config, "low_threshold", 0.25))
+        self.inject_prior_predictions = bool(_read_cfg(config, "inject_prior_predictions", False))
         self.verifier_max_prompt_length = min(
             int(config.data.max_prompt_length),
             int(config.actor_rollout_ref.rollout.prompt_length),
@@ -349,12 +356,12 @@ class MultipleSolutionTTRLRewardManager(RewardManagerBase):
     def _reconsider_boundary_modes(self, prompt_key: str) -> None:
         sets = self.solution_sets[prompt_key]
         counter = self.memory_bank[prompt_key]
-        if sets[SET_CORRECT]:
+        if len(sets[SET_CORRECT]) > 1:
             # Least-observed accepted mode is the weakest member of S_t.
             mode = min(sets[SET_CORRECT], key=lambda item: (counter.get(item, 0), item))
             sets[SET_CORRECT].remove(mode)
             sets[SET_CANDIDATE].add(mode)
-        if sets[SET_WRONG]:
+        if len(sets[SET_WRONG]) > 1:
             # Most-observed rejected mode is the strongest candidate for being a
             # repeatedly generated alternative that deserves another check.
             mode = max(sets[SET_WRONG], key=lambda item: (counter.get(item, 0), item))
@@ -529,6 +536,10 @@ class MultipleSolutionTTRLRewardManager(RewardManagerBase):
         valid_prompt_ids = prompt_ids[-valid_prompt_len:] if valid_prompt_len > 0 else prompt_ids[:0]
         prompt_key = self._prompt_key(valid_prompt_ids)
         prompt_text = self.tokenizer.decode(valid_prompt_ids, skip_special_tokens=True)
+        observations = self._extract_observations(prompt_text)
+        if self.method == "msttrl" and observations:
+            # Keep bank keys stable even when actor prompts include prior predictions.
+            prompt_key = self._prompt_key_from_observations(observations)
 
         response_mask = data.batch.get("response_mask", None)
         if response_mask is not None:
@@ -555,7 +566,7 @@ class MultipleSolutionTTRLRewardManager(RewardManagerBase):
         return {
             "prompt_key": prompt_key,
             "prompt_text": prompt_text,
-            "observations": self._extract_observations(prompt_text),
+            "observations": observations,
             "ground_truth": self._format_ground_truth(ground_truth),
             "solution_mode": solution_mode,
             "final_answer": self._final_answer(response_str, data_source, task_reward_extra_info),
@@ -568,6 +579,11 @@ class MultipleSolutionTTRLRewardManager(RewardManagerBase):
     def _prompt_key(valid_prompt_ids: torch.Tensor) -> str:
         prompt_token_key = ",".join(str(int(token)) for token in valid_prompt_ids.detach().cpu().tolist())
         return hashlib.sha1(prompt_token_key.encode("utf-8")).hexdigest()
+
+    @staticmethod
+    def _prompt_key_from_observations(observations: list[str]) -> str:
+        payload = "\n".join(line.strip() for line in observations)
+        return hashlib.sha1(payload.encode("utf-8")).hexdigest()
 
     @staticmethod
     def _confidence(log_probs: torch.Tensor, response_mask: torch.Tensor) -> float:
@@ -610,7 +626,7 @@ class MultipleSolutionTTRLRewardManager(RewardManagerBase):
     def _solution_mode(response_str: str, data_source: Any, task_reward_extra_info: dict[str, Any]) -> str:
         if str(data_source) == "causal" and "causal_pred" in task_reward_extra_info:
             pred = task_reward_extra_info.get("causal_pred")
-            return "causal:" + (str(pred) if pred else "<invalid>")
+            return "Graph:" + (str(pred) if pred else "<invalid>")
         if "pred" in task_reward_extra_info:
             pred = task_reward_extra_info.get("pred")
             if pred is not None:
@@ -620,6 +636,72 @@ class MultipleSolutionTTRLRewardManager(RewardManagerBase):
     @staticmethod
     def _extract_observations(prompt_text: str) -> list[str]:
         return re.findall(r"Perturb\([^)]+\)\s*->\s*[^\n]+", prompt_text or "")
+
+    @staticmethod
+    def _graph_from_solution_mode(solution_mode: str) -> str:
+        if ":" in solution_mode:
+            return solution_mode.split(":", 1)[1]
+        return solution_mode
+
+    @classmethod
+    def _format_candidate_graph(cls, solution_mode: str) -> str:
+        graph = cls._graph_from_solution_mode(solution_mode)
+        if not graph or graph == "<invalid>":
+            return graph or "<invalid>"
+        if graph == "No edges":
+            return "No edges"
+        edges = [part.strip() for part in graph.split(",") if part.strip()]
+        return ", ".join(edges)
+
+    @classmethod
+    def format_prior_block(cls, correct_modes: set[str] | list[str]) -> str:
+        """Format correct_set modes into the HypoSpace prior-hypothesis block."""
+        lines = []
+        for mode in sorted(correct_modes):
+            graph = cls._graph_from_solution_mode(mode)
+            if not graph or graph == "<invalid>":
+                continue
+            if graph == "No edges":
+                lines.append("Graph: No edges")
+            else:
+                edges = [part.strip() for part in graph.split(",") if part.strip()]
+                lines.append("Graph: " + ", ".join(edges))
+        return "\n".join(lines) if lines else "None"
+
+    def prior_block_for_observations(self, observations: list[str]) -> str:
+        if not observations:
+            return "None"
+        prompt_key = self._prompt_key_from_observations(observations)
+        return self.format_prior_block(self.solution_sets[prompt_key][SET_CORRECT])
+
+    @classmethod
+    def inject_prior_into_prompt_text(cls, prompt_text: str, prior_block: str) -> str:
+        """Insert or replace the prior-prediction section after Observations."""
+        prior_section = f"\n    {PRIOR_SECTION_HEADER}\n    {prior_block}\n"
+        if PRIOR_SECTION_PATTERN.search(prompt_text):
+            return PRIOR_SECTION_PATTERN.sub(prior_section, prompt_text, count=1)
+
+        for marker in ("\n    Task:", "\nTask:", "\n    Diversity rule:", "\nDiversity rule:"):
+            idx = prompt_text.find(marker)
+            if idx != -1:
+                return prompt_text[:idx] + prior_section + prompt_text[idx:]
+        return prompt_text + prior_section
+
+    def inject_prior_into_messages(self, messages: list[dict[str, str]]) -> list[dict[str, str]]:
+        if self.method != "msttrl" or not self.inject_prior_predictions:
+            return messages
+
+        updated = copy.deepcopy(messages)
+        for message in updated:
+            if message.get("role") != "user":
+                continue
+            content = message.get("content")
+            if not isinstance(content, str):
+                continue
+            observations = self._extract_observations(content)
+            prior_block = self.prior_block_for_observations(observations)
+            message["content"] = self.inject_prior_into_prompt_text(content, prior_block)
+        return updated
 
     @staticmethod
     def _format_ground_truth(ground_truth: Any) -> dict[str, Any]:
@@ -709,7 +791,7 @@ class MultipleSolutionTTRLRewardManager(RewardManagerBase):
                 "role": "user",
                 "content": VERIFIER_USER_TEMPLATE.format(
                     observations="\n".join(observations) if observations else "No observations found.",
-                    candidate=solution_mode,
+                    candidate=self._format_candidate_graph(solution_mode),
                 ),
             },
         ]

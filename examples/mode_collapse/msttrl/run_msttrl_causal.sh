@@ -22,15 +22,16 @@ gpu_memory_utilization=0.5
 offload=True
 
 project_name="mode_collapse"
-experiment_name="Qwen3-1.7B-causal-msttrl-v4"
+experiment_name="Qwen3-1.7B-causal-gated-ips-msttrl"
 msttrl_dump_dir="/scratch/ophv164/result/${project_name}/${experiment_name}"
 seed=1337
 
 main_model=/scratch/ophv164/model/Qwen3-1.7B
 
 python3 -m verl.trainer.main_ppo \
-    algorithm.adv_estimator=grpo \
-    algorithm.norm_adv_by_std_in_grpo=False \
+    algorithm.adv_estimator=gated_ips_grpo \
+    algorithm.gated_ips_grpo_lambda=0.5 \
+    algorithm.norm_adv_by_std_in_grpo=True \
     actor_rollout_ref.actor.policy_loss.loss_mode=vanilla \
     data.train_files="${train_files}" \
     data.val_files="${test_files}" \
@@ -71,9 +72,10 @@ python3 -m verl.trainer.main_ppo \
     algorithm.kl_ctrl.kl_coef=0.0 \
     reward.num_workers=1 \
     +msttrl.enable=True \
-    +msttrl.high_threshold=0.9 \
+    +msttrl.high_threshold=0.875 \
     +msttrl.low_threshold=0.5 \
     +msttrl.verifier_n=8 \
+    +msttrl.inject_prior_predictions=False \
     +msttrl.dump_dir=${msttrl_dump_dir} \
     trainer.balance_batch=True \
     trainer.critic_warmup=0 \
@@ -83,7 +85,7 @@ python3 -m verl.trainer.main_ppo \
     trainer.experiment_name=${experiment_name} \
     trainer.n_gpus_per_node=${n_gpus_per_node} \
     trainer.nnodes=1 \
-    trainer.save_freq=-1 \
+    trainer.save_freq=60 \
     trainer.test_freq=5 \
     trainer.total_epochs=10 \
     trainer.log_val_generations=10 \

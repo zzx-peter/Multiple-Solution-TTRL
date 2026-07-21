@@ -27,6 +27,7 @@ from verl.trainer.ppo.core_algos import (
     compute_policy_loss_grpo_dmpo,
     compute_policy_loss_vanilla,
     compute_ips_grpo_outcome_advantage,
+    compute_gated_ips_grpo_outcome_advantage,
     compute_rloo_outcome_advantage,
     compute_rloo_vectorized_outcome_advantage,
     get_adv_estimator_fn,
@@ -320,6 +321,51 @@ def test_ips_grpo_clips_extreme_low_trajectory_probability():
     expected = torch.tensor([[-3.0], [-1.0], [1.0], [3.0]], dtype=torch.float32)
     assert torch.allclose(adv, expected)
     assert torch.allclose(ret, expected)
+
+
+def test_gated_ips_grpo_scales_unit_reward_by_one_minus_lambda_over_prob():
+    token_level_rewards = torch.tensor([[1.0], [1.0], [1.0], [1.0]], dtype=torch.float32)
+    response_mask = torch.ones_like(token_level_rewards)
+    responses = torch.tensor([[10], [10], [20], [30]])
+    index = np.array(["prompt-a"] * 4, dtype=object)
+
+    adv, ret = compute_gated_ips_grpo_outcome_advantage(
+        token_level_rewards=token_level_rewards,
+        response_mask=response_mask,
+        index=index,
+        responses=responses,
+        norm_adv_by_std_in_grpo=False,
+        config={"gated_ips_grpo_lambda": 0.5},
+    )
+
+    expected = torch.tensor([[-0.5], [-0.5], [0.5], [0.5]], dtype=torch.float32)
+    assert torch.allclose(adv, expected)
+    assert torch.allclose(ret, expected)
+
+
+def test_gated_ips_grpo_matches_ips_grpo_for_non_unit_rewards():
+    token_level_rewards = torch.tensor([[0.8], [0.8], [0.2], [0.2]], dtype=torch.float32)
+    response_mask = torch.ones_like(token_level_rewards)
+    responses = torch.tensor([[10], [10], [20], [30]])
+    index = np.array(["prompt-a"] * 4, dtype=object)
+
+    ips_adv, _ = compute_ips_grpo_outcome_advantage(
+        token_level_rewards=token_level_rewards,
+        response_mask=response_mask,
+        index=index,
+        responses=responses,
+        norm_adv_by_std_in_grpo=False,
+    )
+    gated_adv, _ = compute_gated_ips_grpo_outcome_advantage(
+        token_level_rewards=token_level_rewards,
+        response_mask=response_mask,
+        index=index,
+        responses=responses,
+        norm_adv_by_std_in_grpo=False,
+        config={"gated_ips_grpo_lambda": 0.5},
+    )
+
+    assert torch.allclose(gated_adv, ips_adv)
 
 
 @pytest.mark.parametrize(
