@@ -259,7 +259,14 @@ def compute_advantage(
         if adv_estimator in (AdvantageEstimator.GDPO, "gdpo"):
             adv_kwargs["non_tensor_batch"] = data.non_tensor_batch
             adv_kwargs["batch"] = data.batch
-        if adv_estimator in (AdvantageEstimator.IPS_GRPO, "ips_grpo", AdvantageEstimator.GATED_IPS_GRPO, "gated_ips_grpo"):
+        if adv_estimator in (
+            AdvantageEstimator.IPS_GRPO,
+            "ips_grpo",
+            AdvantageEstimator.GATED_IPS_GRPO,
+            "gated_ips_grpo",
+            AdvantageEstimator.GATED_HISTORY_IPS_GRPO,
+            "gated_history_ips_grpo",
+        ):
             adv_kwargs["norm_adv_by_std_in_grpo"] = norm_adv_by_std_in_grpo
             adv_kwargs["non_tensor_batch"] = data.non_tensor_batch
             if "responses" in data.batch:
@@ -642,6 +649,7 @@ class RayPPOTrainer:
             "total_wrong": data.get("total_wrong", 0),
             "verifier_correct_set_accuracy": data.get("verifier_correct_set_accuracy", {}),
             "verifier_example": data.get("verifier_example"),
+            "self_reconsider_failure_count": data.get("self_reconsider_failure_count", 0),
             "solution_sets": data.get("solution_sets", []),
         }
         filename = os.path.join(root_dump_dir, "solution_sets", f"epoch_{epoch}.json")

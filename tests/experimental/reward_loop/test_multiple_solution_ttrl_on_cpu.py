@@ -189,3 +189,71 @@ def test_msttrl_prior_defaults_to_none_for_unknown_prompt():
     updated = manager.inject_prior_into_messages([{"role": "user", "content": base_prompt}])[0]["content"]
     assert "Prior predictions (do not repeat if avoidable):" in updated
     assert "None" in updated
+
+
+def test_self_reconsider_boundary_modes_builds_prompt_and_moves_only_valid_modes():
+    manager = _make_manager()
+    prompt_key = "prompt-key"
+    manager.prompt_bank[prompt_key] = """
+    Perturb(A) -> A:0 B:1 C:0 D:0
+    Perturb(B) -> A:0 B:0 C:0 D:0
+    """
+    manager.solution_sets[prompt_key][SET_CORRECT] = {
+        "causal:A->B",
+        "causal:A->B, B->C",
+        "causal:C->D",
+        "causal:D->A",
+    }
+
+    messages = manager._self_reconsider_boundary_modes(prompt_key)
+    assert "Perturb(A) -> A:0 B:1 C:0 D:0" in messages[1]["content"]
+    assert "A->B, B->C" in messages[1]["content"]
+    assert "Select the 2 most suspicious" in messages[1]["content"]
+
+    moved = manager._self_reconsider_boundary_modes(
+        prompt_key,
+        """
+Suspicious Mode: C->D
+Suspicious Mode: hallucinated->mode
+not the required format: D->A
+Suspicious Mode: C->D
+Suspicious Mode: D->A
+Suspicious Mode: A->B
+""",
+    )
+
+    assert moved == ["causal:C->D", "causal:D->A"]
+    assert manager.solution_sets[prompt_key][SET_CORRECT] == {
+        "causal:A->B",
+        "causal:A->B, B->C",
+    }
+    assert manager.solution_sets[prompt_key]["candidate"] == {
+        "causal:C->D",
+        "causal:D->A",
+    }
+    assert manager.get_state()["self_reconsider_failure_count"] == 1
+
+    manager.reset_epoch_stats()
+    assert manager.get_state()["self_reconsider_failure_count"] == 0
+
+    manager.solution_sets[prompt_key][SET_CORRECT] = {
+        "causal:A->B",
+        "causal:C->D",
+        "causal:D->A",
+    }
+    manager.solution_sets[prompt_key]["candidate"].clear()
+    manager._self_reconsider_boundary_modes(prompt_key, "")
+    assert manager.get_state()["self_reconsider_failure_count"] == 1
+
+    manager.solution_sets[prompt_key][SET_CORRECT] = {
+        "causal:A->B",
+        "causal:C->D",
+        "causal:D->A",
+    }
+    manager.solution_sets[prompt_key]["candidate"].clear()
+    manager._self_reconsider_boundary_modes(
+        prompt_key,
+        "Suspicious Mode: C->D\nSuspicious Mode: D->A",
+    )
+    assert manager.get_state()["self_reconsider_failure_count"] == 2
+    assert manager.solution_sets[prompt_key]["candidate"] == {"causal:C->D"}

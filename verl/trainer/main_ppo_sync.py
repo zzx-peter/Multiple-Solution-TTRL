@@ -142,9 +142,11 @@ def compute_advantage_for_multi_trajectories(
         core_algos.AdvantageEstimator.GRPO,
         core_algos.AdvantageEstimator.IPS_GRPO,
         core_algos.AdvantageEstimator.GATED_IPS_GRPO,
+        core_algos.AdvantageEstimator.GATED_HISTORY_IPS_GRPO,
         "grpo",
         "ips_grpo",
         "gated_ips_grpo",
+        "gated_history_ips_grpo",
     ):
         return compute_advantage(
             data,
@@ -1426,6 +1428,8 @@ class PPOTrainer:
             "ips_grpo",
             core_algos.AdvantageEstimator.GATED_IPS_GRPO,
             "gated_ips_grpo",
+            core_algos.AdvantageEstimator.GATED_HISTORY_IPS_GRPO,
+            "gated_history_ips_grpo",
         ):
             fields.append("responses")
         if self.config.algorithm.adv_estimator == core_algos.AdvantageEstimator.REMAX:

@@ -6,6 +6,7 @@
 import copy
 import hashlib
 import inspect
+import math
 import re
 from collections import Counter, defaultdict
 from typing import Any
@@ -56,6 +57,26 @@ or
 Verification Result: False
 """
 
+RECONSIDER_SYSTEM_PROMPT = "You are a rigorous verifier for causal-graph candidates."
+
+RECONSIDER_USER_TEMPLATE = """Select the {count} most suspicious candidates from the accepted causal graphs.
+
+Rules:
+- When a node is perturbed, it is 0.
+- Its downstream descendants are 1; all other nodes are 0.
+- Follow edges only from left to right.
+- A graph may have at most 6 edges.
+
+Perturbation observations:
+{observations}
+
+Accepted candidates:
+{candidates}
+
+Return exactly {count} lines, copied exactly from the accepted candidates, in this format:
+Suspicious Mode: <candidate>
+"""
+
 SET_CORRECT = "correct"
 SET_CANDIDATE = "candidate"
 SET_WRONG = "wrong"
@@ -104,9 +125,14 @@ class MultipleSolutionTTRLRewardManager(RewardManagerBase):
         self.method = str(_read_cfg(config, "method", "msttrl"))
         if self.method not in {"msttrl", "verifier"}:
             raise ValueError(f"Unknown msttrl.method={self.method!r}. Expected 'msttrl' or 'verifier'.")
-        self.verifier_n = int(_read_cfg(config, "verifier_n", 4))
-        self.high_threshold = float(_read_cfg(config, "high_threshold", 0.75))
-        self.low_threshold = float(_read_cfg(config, "low_threshold", 0.25))
+        self.verifier_n = int(_read_cfg(config, "verifier_n", 8))
+        self.high_threshold = float(_read_cfg(config, "high_threshold", 0.875))
+        self.low_threshold = float(_read_cfg(config, "low_threshold", 0.5))
+        # Fraction of each boundary set reconsidered after a reward update.
+        # These can be overridden through msttrl/reward_kwargs while debugging;
+        # no launcher-script arguments are required.
+        self.reconsider_correct_ratio = float(_read_cfg(config, "reconsider_correct_ratio", 0.3))
+        self.reconsider_wrong_ratio = float(_read_cfg(config, "reconsider_wrong_ratio", 0.1))
         self.inject_prior_predictions = bool(_read_cfg(config, "inject_prior_predictions", False))
         self.verifier_max_prompt_length = min(
             int(config.data.max_prompt_length),
@@ -117,6 +143,12 @@ class MultipleSolutionTTRLRewardManager(RewardManagerBase):
         self.apply_chat_template_kwargs = dict(config.data.get("apply_chat_template_kwargs", {}))
         if self.low_threshold > self.high_threshold:
             raise ValueError("msttrl.low_threshold must be <= msttrl.high_threshold.")
+        for name, ratio in (
+            ("reconsider_correct_ratio", self.reconsider_correct_ratio),
+            ("reconsider_wrong_ratio", self.reconsider_wrong_ratio),
+        ):
+            if not 0.0 <= ratio <= 1.0:
+                raise ValueError(f"msttrl.{name} must be between 0 and 1, got {ratio}.")
         # Counts how often each prompt emits each valid solution mode across
         # training batches. This is used for inspection and boundary-mode moves.
         self.memory_bank: dict[str, Counter[str]] = defaultdict(Counter)
@@ -151,6 +183,9 @@ class MultipleSolutionTTRLRewardManager(RewardManagerBase):
         self.epoch_verifier_correct_count = 0
         self.epoch_verifier_correct_ground_truth_count = 0
         self.epoch_verifier_example: dict[str, Any] | None = None
+        # Number of self-reconsider responses in the current epoch that contain
+        # invalid selections or do not provide exactly the requested count.
+        self.epoch_self_reconsider_failure_count = 0
 
     async def run_batch(self, data: DataProto) -> list[dict[str, Any]]:
         # During normal MSTTRL training the verifier path prepares rows first.
@@ -298,7 +333,15 @@ class MultipleSolutionTTRLRewardManager(RewardManagerBase):
         outputs = []
         for row in rows:
             prompt_memory = self.memory_bank[row["prompt_key"]]
+            # Historical denominator for gated-history IPS-GRPO: the sum of
+            # occurrence counts of every solution currently in correct_set.
+            # Example: counts A=4, B=5, C=6 give a denominator of 15.
+            correct_set_total_count = sum(
+                prompt_memory[mode] for mode in self.solution_sets[row["prompt_key"]][SET_CORRECT]
+            )
             is_invalid_mode = self._is_invalid_mode(row["solution_mode"])
+            # Historical numerator for this response: how many times its
+            # solution has appeared in the prompt's memory bank.
             history_count = 0 if is_invalid_mode else prompt_memory[row["solution_mode"]]
             confidence = row["confidence"]
             if self.method == "verifier":
@@ -323,6 +366,7 @@ class MultipleSolutionTTRLRewardManager(RewardManagerBase):
                         "msttrl_plausibility": plausibility,
                         "msttrl_confidence": confidence,
                         "msttrl_history_count": float(history_count),
+                        "msttrl_correct_set_total_count": float(correct_set_total_count),
                         "msttrl_set": set_name,
                         "msttrl_solution_mode": row["solution_mode"],
                         "msttrl_final_answer": row["final_answer"],
@@ -351,22 +395,105 @@ class MultipleSolutionTTRLRewardManager(RewardManagerBase):
             self.last_reward_sum[prompt_key] = reward_sum
             if prev_sum is None:
                 continue
-            self._reconsider_boundary_modes(prompt_key)
+            # self._reconsider_boundary_modes(prompt_key)
+            self._self_reconsider_boundary_modes(prompt_key)
 
     def _reconsider_boundary_modes(self, prompt_key: str) -> None:
         sets = self.solution_sets[prompt_key]
         counter = self.memory_bank[prompt_key]
         if len(sets[SET_CORRECT]) > 1:
-            # Least-observed accepted mode is the weakest member of S_t.
-            mode = min(sets[SET_CORRECT], key=lambda item: (counter.get(item, 0), item))
-            sets[SET_CORRECT].remove(mode)
-            sets[SET_CANDIDATE].add(mode)
+            # The least-observed A% are the weakest members of S_t. Keep at
+            # least one accepted mode, matching the previous boundary rule.
+            count = min(
+                math.ceil(len(sets[SET_CORRECT]) * self.reconsider_correct_ratio),
+                len(sets[SET_CORRECT]) - 1,
+            )
+            modes = sorted(sets[SET_CORRECT], key=lambda item: (counter.get(item, 0), item))[:count]
+            sets[SET_CORRECT].difference_update(modes)
+            sets[SET_CANDIDATE].update(modes)
         if len(sets[SET_WRONG]) > 1:
-            # Most-observed rejected mode is the strongest candidate for being a
-            # repeatedly generated alternative that deserves another check.
-            mode = max(sets[SET_WRONG], key=lambda item: (counter.get(item, 0), item))
-            sets[SET_WRONG].remove(mode)
-            sets[SET_CANDIDATE].add(mode)
+            # The most-observed B% are repeatedly generated alternatives that
+            # deserve another check. Keep at least one rejected mode.
+            count = min(
+                math.ceil(len(sets[SET_WRONG]) * self.reconsider_wrong_ratio),
+                len(sets[SET_WRONG]) - 1,
+            )
+            modes = sorted(
+                sets[SET_WRONG], key=lambda item: (-counter.get(item, 0), item)
+            )[:count]
+            sets[SET_WRONG].difference_update(modes)
+            sets[SET_CANDIDATE].update(modes)
+
+    def _self_reconsider_boundary_modes(
+        self,
+        prompt_key: str,
+        model_output: str | None = None,
+    ) -> list[dict[str, str]] | list[str]:
+        """Build a self-reconsideration request or apply the model's selection.
+
+        Calling without ``model_output`` returns chat messages for the rollout
+        model. Calling again with its response moves valid selected modes from
+        correct to candidate. Hallucinated, malformed, duplicate, or excess
+        selections are ignored.
+        """
+        correct_modes = self.solution_sets[prompt_key][SET_CORRECT]
+        if len(correct_modes) <= 1:
+            return []
+
+        count = min(
+            math.ceil(len(correct_modes) * self.reconsider_correct_ratio),
+            len(correct_modes) - 1,
+        )
+        if count <= 0:
+            return []
+
+        formatted_to_mode = {
+            self._format_candidate_graph(mode): mode
+            for mode in correct_modes
+            if not self._is_invalid_mode(mode)
+        }
+        if model_output is None:
+            observations = self._extract_observations(
+                self.prompt_bank.get(prompt_key, "")[-VERIFIER_MAX_PROBLEM_CHARS:]
+            )
+            candidates = "\n".join(sorted(formatted_to_mode)) or "None"
+            return [
+                {"role": "system", "content": RECONSIDER_SYSTEM_PROMPT},
+                {
+                    "role": "user",
+                    "content": RECONSIDER_USER_TEMPLATE.format(
+                        count=count,
+                        observations="\n".join(observations) if observations else "No observations found.",
+                        candidates=candidates,
+                    ),
+                },
+            ]
+
+        selected_modes = []
+        has_invalid_selection = False
+        for line in (model_output or "").splitlines():
+            if not line.strip():
+                continue
+            match = re.fullmatch(r"\s*Suspicious Mode:\s*(.+?)\s*", line)
+            if match is None:
+                has_invalid_selection = True
+                continue
+            mode = formatted_to_mode.get(match.group(1))
+            if mode is None or mode in selected_modes:
+                has_invalid_selection = True
+                continue
+            selected_modes.append(mode)
+
+        if has_invalid_selection or len(selected_modes) != count:
+            self.epoch_self_reconsider_failure_count += 1
+        # Even when the model returns too many valid modes, only remove the
+        # first requested number, preserving the original reconsideration ratio.
+        selected_modes = selected_modes[:count]
+
+        sets = self.solution_sets[prompt_key]
+        sets[SET_CORRECT].difference_update(selected_modes)
+        sets[SET_CANDIDATE].update(selected_modes)
+        return selected_modes
 
     def _modes_to_verify(
         self,
@@ -487,6 +614,7 @@ class MultipleSolutionTTRLRewardManager(RewardManagerBase):
                 ),
             },
             "verifier_example": self.epoch_verifier_example,
+            "self_reconsider_failure_count": self.epoch_self_reconsider_failure_count,
         }
 
     def reset_epoch_stats(self) -> dict[str, Any]:
@@ -495,6 +623,7 @@ class MultipleSolutionTTRLRewardManager(RewardManagerBase):
         self.epoch_verifier_correct_count = 0
         self.epoch_verifier_correct_ground_truth_count = 0
         self.epoch_verifier_example = None
+        self.epoch_self_reconsider_failure_count = 0
         return {}
 
     def _set_rows(self, prompt_key: str, set_name: str) -> list[dict[str, Any]]:

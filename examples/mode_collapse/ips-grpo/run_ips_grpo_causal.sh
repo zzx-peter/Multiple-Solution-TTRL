@@ -4,8 +4,8 @@ export CUDA_VISIBLE_DEVICES=0
 export RAY_EXPERIMENTAL_NOSET_CUDA_VISIBLE_DEVICES=1
 export WANDB_API_KEY="3ad98c1a4043033c1a4ea70737ebb314a2f09ba0"
 export PYTHONPATH=/scratch/ophv164/code/verl-v0.8.0:$PYTHONPATH
-causal_path="/scratch/ophv164/data/hypespace/causal_reason/train.parquet"
-causal_test_path="/scratch/ophv164/data/hypespace/causal_reason/test.parquet"
+causal_path="/scratch/Projects/CFP-04/CFP04-CF-024/ophv164/data/hypespace/causal_reason/train.parquet"
+causal_test_path="/scratch/Projects/CFP-04/CFP04-CF-024/ophv164/data/hypespace/causal_reason/test.parquet"
 
 train_files="['$causal_path']"
 test_files="['$causal_test_path']"
@@ -24,7 +24,7 @@ project_name="mode_collapse"
 experiment_name="Qwen3-1.7B-causal-reason-ips-grpo-norm"
 seed=1337
 
-main_model=/scratch/ophv164/model/Qwen3-1.7B
+main_model=/scratch/Projects/CFP-04/CFP04-CF-024/ophv164/model/Qwen3-1.7B
 
 python3 -m verl.trainer.main_ppo \
     algorithm.adv_estimator=ips_grpo \
@@ -74,8 +74,8 @@ python3 -m verl.trainer.main_ppo \
     trainer.experiment_name=${experiment_name} \
     trainer.n_gpus_per_node=${n_gpus_per_node} \
     trainer.nnodes=1 \
-    trainer.save_freq=60 \
+    trainer.save_freq=-1 \
     trainer.test_freq=5 \
-    trainer.total_epochs=10 \
+    trainer.total_epochs=20 \
     trainer.log_val_generations=10 \
     trainer.default_local_dir=/scratch/ophv164/result/${project_name}/${experiment_name}$@

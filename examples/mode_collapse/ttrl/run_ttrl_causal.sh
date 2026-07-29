@@ -4,8 +4,8 @@ export CUDA_VISIBLE_DEVICES=0
 export RAY_EXPERIMENTAL_NOSET_CUDA_VISIBLE_DEVICES=1
 export WANDB_API_KEY="3ad98c1a4043033c1a4ea70737ebb314a2f09ba0"
 export PYTHONPATH=/scratch/ophv164/code/verl-v0.8.0:$PYTHONPATH
-causal_path="/scratch/ophv164/data/hypespace/causal_reason/train.parquet"
-causal_test_path="/scratch/ophv164/data/hypespace/causal_reason/test.parquet"
+causal_path="/scratch/Projects/CFP-04/CFP04-CF-024/ophv164/data/hypespace/causal_reason/train.parquet"
+causal_test_path="/scratch/Projects/CFP-04/CFP04-CF-024/ophv164/data/hypespace/causal_reason/test.parquet"
 
 train_files="['$causal_path']"
 test_files="['$causal_test_path']"
@@ -21,13 +21,13 @@ gpu_memory_utilization=0.5
 offload=True
 
 project_name="mode_collapse"
-experiment_name="Qwen3-1.7B-causal-reason-ips-ttrl4"
+experiment_name="Qwen3-1.7B-causal-reason-ttrl"
 seed=1337
 
-main_model=/scratch/ophv164/model/Qwen3-1.7B
+main_model=/scratch/Projects/CFP-04/CFP04-CF-024/ophv164/model/Qwen3-1.7B
 
 python3 -m verl.trainer.main_ppo \
-    algorithm.adv_estimator=ips_grpo \
+    algorithm.adv_estimator=grpo \
     algorithm.norm_adv_by_std_in_grpo=True \
     actor_rollout_ref.actor.policy_loss.loss_mode=vanilla \
     data.train_files="${train_files}" \
@@ -68,7 +68,7 @@ python3 -m verl.trainer.main_ppo \
     algorithm.kl_ctrl.kl_coef=0.0 \
     reward.num_workers=1 \
     +ttrl.enable=True \
-    +ttrl.num_ans=4 \
+    +ttrl.num_ans=1 \
     trainer.balance_batch=True \
     trainer.critic_warmup=0 \
     trainer.logger='["tensorboard","wandb"]' \
@@ -79,6 +79,6 @@ python3 -m verl.trainer.main_ppo \
     trainer.nnodes=1 \
     trainer.save_freq=-1 \
     trainer.test_freq=5 \
-    trainer.total_epochs=10 \
+    trainer.total_epochs=20 \
     trainer.log_val_generations=10 \
     trainer.default_local_dir=/scratch/ophv164/result/${project_name}/${experiment_name}$@

@@ -89,6 +89,7 @@ class AdvantageEstimator(str, Enum):
     GRPO = "grpo"
     IPS_GRPO = "ips_grpo"
     GATED_IPS_GRPO = "gated_ips_grpo"
+    GATED_HISTORY_IPS_GRPO = "gated_history_ips_grpo"
     REINFORCE_PLUS_PLUS = "reinforce_plus_plus"
     REINFORCE_PLUS_PLUS_BASELINE = "reinforce_plus_plus_baseline"
     REMAX = "remax"
@@ -542,9 +543,103 @@ def compute_gated_ips_grpo_outcome_advantage(
             traj_count = id2traj_count[group_id][id2traj_key[i]]
             traj_prob = max(traj_count / group_size, prob_floor)
             if abs(float(scores[i]) - 1.0) <= reward_match_tolerance:
-                scaled_scores[i] = (1.0 - gated_lambda) / traj_prob
+                scaled_scores[i] = gated_lambda + (1.0 - gated_lambda) / traj_prob
             else:
-                scaled_scores[i] = scores[i] / traj_prob
+                scaled_scores[i] = scores[i]
+            print("Score:", float(scores[i]), "Scaled Score:", float(scaled_scores[i]), "Prob:", traj_prob)
+
+        id2score = defaultdict(list)
+        for i in range(bsz):
+            id2score[index[i]].append(scaled_scores[i])
+
+        id2mean, id2std = {}, {}
+        for idx, group_scores in id2score.items():
+            if len(group_scores) == 1:
+                id2mean[idx] = scaled_scores.new_tensor(0.0)
+                id2std[idx] = scaled_scores.new_tensor(1.0)
+            else:
+                scores_tensor = torch.stack(group_scores)
+                id2mean[idx] = scores_tensor.mean()
+                id2std[idx] = scores_tensor.std()
+
+        for i in range(bsz):
+            if norm_adv_by_std_in_grpo:
+                scaled_scores[i] = (scaled_scores[i] - id2mean[index[i]]) / (id2std[index[i]] + epsilon)
+            else:
+                scaled_scores[i] = scaled_scores[i] - id2mean[index[i]]
+
+        advantages = scaled_scores.unsqueeze(-1) * response_mask
+    return advantages, advantages
+
+
+@register_adv_est(AdvantageEstimator.GATED_HISTORY_IPS_GRPO)
+def compute_gated_history_ips_grpo_outcome_advantage(
+    token_level_rewards: torch.Tensor,
+    response_mask: torch.Tensor,
+    index: np.ndarray,
+    responses: Optional[torch.Tensor] = None,
+    non_tensor_batch: Optional[dict] = None,
+    epsilon: float = 1e-6,
+    norm_adv_by_std_in_grpo: bool = True,
+    config: Optional[AlgoConfig] = None,
+    **kwargs,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Gated IPS-GRPO using historical correct-set frequencies for ``prob``.
+
+    This is identical to gated IPS-GRPO except that a correct trajectory's
+    probability is its cumulative history count divided by the cumulative
+    count of every solution currently in the prompt's correct set.
+    """
+    with torch.no_grad():
+        scores = token_level_rewards.sum(dim=-1)
+        scaled_scores = scores.clone()
+        prob_floor = config.get("ips_grpo_prob_clip_epsilon", epsilon) if config is not None else epsilon
+        debug_print_answers = config.get("ips_grpo_debug_print_answers", True) if config is not None else True
+        gated_lambda = config.get("gated_ips_grpo_lambda", 0.5) if config is not None else 0.5
+        reward_match_tolerance = (
+            config.get("gated_ips_grpo_reward_match_tolerance", 1e-6) if config is not None else 1e-6
+        )
+
+        if non_tensor_batch is None:
+            raise ValueError("gated_history_ips_grpo requires MSTTRL reward metadata.")
+        # Numerator per mode: cumulative occurrences of its solution.
+        history_counts = non_tensor_batch.get("msttrl_history_count")
+        # Denominator per mode: cumulative occurrences of all solutions in
+        # the corresponding prompt's correct_set.
+        correct_set_total_counts = non_tensor_batch.get("msttrl_correct_set_total_count")
+        if history_counts is None or correct_set_total_counts is None:
+            raise ValueError(
+                "gated_history_ips_grpo requires msttrl_history_count and "
+                "msttrl_correct_set_total_count in non_tensor_batch."
+            )
+
+        bsz = scores.shape[0]
+        for i in range(bsz):
+            if abs(float(scores[i]) - 1.0) <= reward_match_tolerance:
+                history_count = float(history_counts[i])
+                correct_set_total_count = float(correct_set_total_counts[i])
+                if history_count <= 0.0 or correct_set_total_count <= 0.0:
+                    raise ValueError(
+                        "Correct responses must have positive history and correct-set total counts, "
+                        f"got history_count={history_count}, "
+                        f"correct_set_total_count={correct_set_total_count}."
+                    )
+                # Historical probability within correct_set. For example, if
+                # A, B, C have counts 4, 5, 6, then prob(C) = 6 / 15.
+                traj_prob = max(history_count / correct_set_total_count, prob_floor)
+                scaled_scores[i] = gated_lambda + (1.0 - gated_lambda) / traj_prob
+            else:
+                traj_prob = None
+                scaled_scores[i] = scores[i]
+            if debug_print_answers:
+                print(
+                    "Score:",
+                    float(scores[i]),
+                    "Scaled Score:",
+                    float(scaled_scores[i]),
+                    "History Prob:",
+                    traj_prob,
+                )
 
         id2score = defaultdict(list)
         for i in range(bsz):

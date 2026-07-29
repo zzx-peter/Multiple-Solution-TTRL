@@ -28,6 +28,7 @@ from verl.trainer.ppo.core_algos import (
     compute_policy_loss_vanilla,
     compute_ips_grpo_outcome_advantage,
     compute_gated_ips_grpo_outcome_advantage,
+    compute_gated_history_ips_grpo_outcome_advantage,
     compute_rloo_outcome_advantage,
     compute_rloo_vectorized_outcome_advantage,
     get_adv_estimator_fn,
@@ -366,6 +367,42 @@ def test_gated_ips_grpo_matches_ips_grpo_for_non_unit_rewards():
     )
 
     assert torch.allclose(gated_adv, ips_adv)
+
+
+def test_gated_history_ips_grpo_uses_correct_set_history_probability():
+    token_level_rewards = torch.tensor([[1.0], [0.0]], dtype=torch.float32)
+    response_mask = torch.ones_like(token_level_rewards)
+    index = np.array(["prompt-a", "prompt-a"], dtype=object)
+    non_tensor_batch = {
+        "msttrl_history_count": np.array([2.0, 10.0]),
+        "msttrl_correct_set_total_count": np.array([8.0, 8.0]),
+    }
+
+    adv, ret = compute_gated_history_ips_grpo_outcome_advantage(
+        token_level_rewards=token_level_rewards,
+        response_mask=response_mask,
+        index=index,
+        non_tensor_batch=non_tensor_batch,
+        norm_adv_by_std_in_grpo=False,
+        config={"gated_ips_grpo_lambda": 0.5, "ips_grpo_debug_print_answers": False},
+    )
+
+    # Correct trajectory prob = 2 / 8, so its gated score is
+    # 0.5 + (1 - 0.5) / 0.25 = 2.5. Group centering yields +/-1.25.
+    expected = torch.tensor([[1.25], [-1.25]], dtype=torch.float32)
+    assert torch.allclose(adv, expected)
+    assert torch.allclose(ret, expected)
+
+
+def test_gated_history_ips_grpo_requires_correct_set_history_metadata():
+    with pytest.raises(ValueError, match="requires msttrl_history_count"):
+        compute_gated_history_ips_grpo_outcome_advantage(
+            token_level_rewards=torch.tensor([[1.0]], dtype=torch.float32),
+            response_mask=torch.tensor([[1.0]], dtype=torch.float32),
+            index=np.array(["prompt-a"], dtype=object),
+            non_tensor_batch={},
+            config={"ips_grpo_debug_print_answers": False},
+        )
 
 
 @pytest.mark.parametrize(
