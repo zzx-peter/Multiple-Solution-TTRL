@@ -94,6 +94,10 @@ def default_compute_score(
         from . import causal
 
         res = causal.compute_score(solution_str, ground_truth)
+    elif data_source == "3d":
+        from . import three_d
+
+        res = three_d.compute_score(solution_str, ground_truth)
     elif data_source in [
         "searchR1_nq",
         "searchR1_triviaqa",

@@ -373,7 +373,9 @@ def compute_ips_grpo_outcome_advantage(
         scaled_scores = scores.clone()
         prob_floor = config.get("ips_grpo_prob_clip_epsilon", epsilon) if config is not None else epsilon
         answer_key = config.get("ips_grpo_answer_key", None) if config is not None else None
-        answer_key_candidates = [answer_key, "causal_pred", "pred"] if answer_key else ["causal_pred", "pred"]
+        answer_key_candidates = (
+            [answer_key, "causal_pred", "3d_pred", "pred"] if answer_key else ["causal_pred", "3d_pred", "pred"]
+        )
         debug_print_answers = config.get("ips_grpo_debug_print_answers", True) if config is not None else True
         debug_answer_max_chars = config.get("ips_grpo_debug_answer_max_chars", 200) if config is not None else 200
 
@@ -480,7 +482,9 @@ def compute_gated_ips_grpo_outcome_advantage(
         scaled_scores = scores.clone()
         prob_floor = config.get("ips_grpo_prob_clip_epsilon", epsilon) if config is not None else epsilon
         answer_key = config.get("ips_grpo_answer_key", None) if config is not None else None
-        answer_key_candidates = [answer_key, "causal_pred", "pred"] if answer_key else ["causal_pred", "pred"]
+        answer_key_candidates = (
+            [answer_key, "causal_pred", "3d_pred", "pred"] if answer_key else ["causal_pred", "3d_pred", "pred"]
+        )
         debug_print_answers = config.get("ips_grpo_debug_print_answers", True) if config is not None else True
         debug_answer_max_chars = config.get("ips_grpo_debug_answer_max_chars", 200) if config is not None else 200
         gated_lambda = config.get("gated_ips_grpo_lambda", 0.5) if config is not None else 0.5

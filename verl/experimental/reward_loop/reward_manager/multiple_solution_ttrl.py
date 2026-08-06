@@ -3,7 +3,6 @@
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
 
-import copy
 import hashlib
 import inspect
 import math
@@ -19,12 +18,18 @@ from verl import DataProto
 from verl.experimental.reward_loop.reward_manager import register
 from verl.experimental.reward_loop.reward_manager.base import RewardManagerBase
 from verl.utils.reward_score import default_compute_score
+from verl.utils.reward_score.three_d import (
+    _canonical_structure,
+    _format_structure,
+    _structure_from_key,
+    _structure_key,
+)
 
-VERIFIER_SYSTEM_PROMPT = "You are a rigorous verifier for causal-graph candidates."
+CAUSAL_VERIFIER_SYSTEM_PROMPT = "You are a rigorous verifier for causal-graph candidates."
 
 # The parser below looks for a "Verification Result" line, so keep the verifier
 # prompt explicit and stable across sampled verification attempts.
-VERIFIER_USER_TEMPLATE = """Verify whether the candidate causal graph explains the perturbation observations.
+CAUSAL_VERIFIER_USER_TEMPLATE = """Verify whether the candidate causal graph explains the perturbation observations.
 
 Semantics:
 - When a node is perturbed, the perturbed node is 0.
@@ -57,9 +62,47 @@ or
 Verification Result: False
 """
 
-RECONSIDER_SYSTEM_PROMPT = "You are a rigorous verifier for causal-graph candidates."
+THREE_D_VERIFIER_SYSTEM_PROMPT = (
+    "You verify 3D block structures. Treat every matrix as fixed data and never move, add, or remove a digit."
+)
 
-RECONSIDER_USER_TEMPLATE = """Select the {count} most suspicious candidates from the accepted causal graphs.
+THREE_D_VERIFIER_USER_TEMPLATE = """Verify whether the candidate 3D block structure explains the observations.
+
+Rules:
+- Every layer must be a {grid_size}x{grid_size} binary grid.
+- Layer 1 is the non-empty bottom layer, and there may be at most {max_height} layers.
+- Every upper-layer block must have a block directly below it.
+- The final layer must not be empty.
+- A supported structure's projected Top View is exactly Layer 1.
+- The candidate is valid only when its projected Top View matches every observed cell.
+
+3D observations:
+{observations}
+
+Candidate structure:
+{candidate}
+
+Check the candidate in this order:
+1. Check dimensions, layer numbering, non-empty bottom/top layers, height, and support.
+2. Copy the observed matrix without changing it.
+3. Copy candidate Layer 1 as the projected Top View. Do not copy digits from the observation.
+4. Compare all nine cells and list every mismatch using 1-based row and column numbers.
+
+Return only this form:
+Structural Check: Pass or Fail
+Observed Top View:
+<three rows copied from the observation>
+Candidate Projected Top View:
+<three rows copied from candidate Layer 1>
+Mismatches: None, or a list such as (row 2, column 3): observed=1, candidate=0
+Verification Result: True or False
+
+The result is True if and only if the structural check passes and Mismatches is None.
+"""
+
+CAUSAL_RECONSIDER_SYSTEM_PROMPT = "You are a rigorous verifier for causal-graph candidates."
+
+CAUSAL_RECONSIDER_USER_TEMPLATE = """Select the {count} most suspicious candidates from the accepted causal graphs.
 
 Rules:
 - When a node is perturbed, it is 0.
@@ -77,15 +120,29 @@ Return exactly {count} lines, copied exactly from the accepted candidates, in th
 Suspicious Mode: <candidate>
 """
 
+THREE_D_RECONSIDER_SYSTEM_PROMPT = "You are a rigorous verifier for 3D block-structure candidates."
+
+THREE_D_RECONSIDER_USER_TEMPLATE = """Select the {count} most suspicious candidates from the accepted 3D structures.
+
+Rules:
+- Each candidate consists of consecutive {grid_size}x{grid_size} binary layers from bottom to top.
+- Every block above Layer 1 must be supported directly from below.
+- A top-view cell is 1 exactly when its vertical stack contains at least one block.
+- The structure may have at most {max_height} layers.
+
+3D observations:
+{observations}
+
+Accepted candidates (each candidate is a single canonical line):
+{candidates}
+
+Return exactly {count} lines, copied exactly from the accepted candidates, in this format:
+Suspicious Mode: <candidate>
+"""
+
 SET_CORRECT = "correct"
 SET_CANDIDATE = "candidate"
 SET_WRONG = "wrong"
-VERIFIER_MAX_PROBLEM_CHARS = 2048
-PRIOR_SECTION_HEADER = "Prior predictions (do not repeat if avoidable):"
-PRIOR_SECTION_PATTERN = re.compile(
-    r"\n\s*Prior predictions \(do not repeat if avoidable\):\s*\n.*?(?=\n\s*Task:|\n\s*Diversity rule:|\Z)",
-    flags=re.DOTALL | re.IGNORECASE,
-)
 
 
 def _read_cfg(config, key: str, default: Any) -> Any:
@@ -133,7 +190,6 @@ class MultipleSolutionTTRLRewardManager(RewardManagerBase):
         # no launcher-script arguments are required.
         self.reconsider_correct_ratio = float(_read_cfg(config, "reconsider_correct_ratio", 0.3))
         self.reconsider_wrong_ratio = float(_read_cfg(config, "reconsider_wrong_ratio", 0.1))
-        self.inject_prior_predictions = bool(_read_cfg(config, "inject_prior_predictions", False))
         self.verifier_max_prompt_length = min(
             int(config.data.max_prompt_length),
             int(config.actor_rollout_ref.rollout.prompt_length),
@@ -155,6 +211,9 @@ class MultipleSolutionTTRLRewardManager(RewardManagerBase):
         # Stores prompt text by prompt hash so later verifier prompts can be
         # built from compact prompt keys carried through the rollout batch.
         self.prompt_bank: dict[str, str] = {}
+        # Dataset type is stored beside each prompt so asynchronous verifier
+        # and reconsideration requests use task-specific formatting.
+        self.data_source_bank: dict[str, str] = {}
         # Stores compact debug-only problem fields for JSON dumps.
         self.observation_bank: dict[str, list[str]] = {}
         self.ground_truth_bank: dict[str, dict[str, Any]] = {}
@@ -229,7 +288,12 @@ class MultipleSolutionTTRLRewardManager(RewardManagerBase):
                 for _ in range(self.verifier_n):
                     # Multiple sampled verifier responses estimate p_t(z) as a
                     # pass rate instead of relying on a single brittle judgment.
-                    messages = self._verification_messages(self.prompt_bank[prompt_key], mode)
+                    messages = self._verification_messages(
+                        self.prompt_bank[prompt_key],
+                        mode,
+                        self.data_source_bank[prompt_key],
+                        self.ground_truth_bank[prompt_key],
+                    )
                     prompts.append(messages)
                     prompt_keys.append(prompt_key)
                     solution_modes.append(mode)
@@ -312,6 +376,7 @@ class MultipleSolutionTTRLRewardManager(RewardManagerBase):
         rows = [await self._extract_row(data, i) for i in range(len(data))]
         for row in rows:
             self.prompt_bank[row["prompt_key"]] = row["prompt_text"]
+            self.data_source_bank[row["prompt_key"]] = row["data_source"]
             self.observation_bank[row["prompt_key"]] = row["observations"]
             self.ground_truth_bank[row["prompt_key"]] = row["ground_truth"]
 
@@ -383,9 +448,6 @@ class MultipleSolutionTTRLRewardManager(RewardManagerBase):
         return outputs
 
     def _maintain_sets(self, rows: list[dict[str, Any]], outputs: list[dict[str, Any]]) -> None:
-        # Track reward movement per prompt. When the current batch's total reward
-        # is higher than the previous time this prompt appeared, reopen boundary
-        # modes for candidate verification.
         reward_sums: dict[str, float] = defaultdict(float)
         for row, output in zip(rows, outputs, strict=True):
             reward_sums[row["prompt_key"]] += float(output["reward_score"])
@@ -395,7 +457,6 @@ class MultipleSolutionTTRLRewardManager(RewardManagerBase):
             self.last_reward_sum[prompt_key] = reward_sum
             if prev_sum is None:
                 continue
-            # self._reconsider_boundary_modes(prompt_key)
             self._self_reconsider_boundary_modes(prompt_key)
 
     def _reconsider_boundary_modes(self, prompt_key: str) -> None:
@@ -447,26 +508,35 @@ class MultipleSolutionTTRLRewardManager(RewardManagerBase):
         if count <= 0:
             return []
 
+        data_source = self.data_source_bank[prompt_key]
         formatted_to_mode = {
-            self._format_candidate_graph(mode): mode
+            self._format_reconsider_candidate(mode, data_source): mode
             for mode in correct_modes
             if not self._is_invalid_mode(mode)
         }
         if model_output is None:
-            observations = self._extract_observations(
-                self.prompt_bank.get(prompt_key, "")[-VERIFIER_MAX_PROBLEM_CHARS:]
-            )
+            observations = self.observation_bank.get(prompt_key, [])
             candidates = "\n".join(sorted(formatted_to_mode)) or "None"
+            if data_source == "3d":
+                ground_truth = self.ground_truth_bank.get(prompt_key, {})
+                system_prompt = THREE_D_RECONSIDER_SYSTEM_PROMPT
+                user_prompt = THREE_D_RECONSIDER_USER_TEMPLATE.format(
+                    count=count,
+                    grid_size=ground_truth.get("grid_size", 3),
+                    max_height=ground_truth.get("max_height", 3),
+                    observations="\n".join(observations) if observations else "No observations found.",
+                    candidates=candidates,
+                )
+            else:
+                system_prompt = CAUSAL_RECONSIDER_SYSTEM_PROMPT
+                user_prompt = CAUSAL_RECONSIDER_USER_TEMPLATE.format(
+                    count=count,
+                    observations="\n".join(observations) if observations else "No observations found.",
+                    candidates=candidates,
+                )
             return [
-                {"role": "system", "content": RECONSIDER_SYSTEM_PROMPT},
-                {
-                    "role": "user",
-                    "content": RECONSIDER_USER_TEMPLATE.format(
-                        count=count,
-                        observations="\n".join(observations) if observations else "No observations found.",
-                        candidates=candidates,
-                    ),
-                },
+                {"role": "system", "content": system_prompt},
+                {"role": "user", "content": user_prompt},
             ]
 
         selected_modes = []
@@ -604,6 +674,7 @@ class MultipleSolutionTTRLRewardManager(RewardManagerBase):
             "total_correct": sum(item["num_correct"] for item in solution_sets),
             "total_candidate": sum(item["num_candidate"] for item in solution_sets),
             "total_wrong": sum(item["num_wrong"] for item in solution_sets),
+            "set_mode_correctness": self._set_mode_correctness_statistics(solution_sets),
             "verifier_correct_set_accuracy": {
                 "num_modes": self.epoch_verifier_correct_count,
                 "num_ground_truth_modes": self.epoch_verifier_correct_ground_truth_count,
@@ -616,6 +687,24 @@ class MultipleSolutionTTRLRewardManager(RewardManagerBase):
             "verifier_example": self.epoch_verifier_example,
             "self_reconsider_failure_count": self.epoch_self_reconsider_failure_count,
         }
+
+    @staticmethod
+    def _set_mode_correctness_statistics(solution_sets: list[dict[str, Any]]) -> dict[str, dict[str, Any]]:
+        """Summarize ground-truth correctness within each routing set."""
+        statistics = {}
+        for set_name in (SET_CORRECT, SET_CANDIDATE, SET_WRONG):
+            rows = [row for prompt in solution_sets for row in prompt.get(f"{set_name}_set", [])]
+            num_modes = len(rows)
+            num_correct_modes = sum(bool(row.get("is_ground_truth", False)) for row in rows)
+            num_incorrect_modes = num_modes - num_correct_modes
+            statistics[f"{set_name}_set"] = {
+                "num_modes": num_modes,
+                "num_correct_modes": num_correct_modes,
+                "num_incorrect_modes": num_incorrect_modes,
+                "correct_mode_ratio": num_correct_modes / num_modes if num_modes else None,
+                "incorrect_mode_ratio": num_incorrect_modes / num_modes if num_modes else None,
+            }
+        return statistics
 
     def reset_epoch_stats(self) -> dict[str, Any]:
         self.valid_mode_count_bank.clear()
@@ -640,13 +729,19 @@ class MultipleSolutionTTRLRewardManager(RewardManagerBase):
 
     def _is_ground_truth_mode(self, prompt_key: str, solution_mode: str) -> bool:
         ground_truth = self.ground_truth_bank.get(prompt_key, {})
-        graphs = set(ground_truth.get("graphs", [])) if isinstance(ground_truth, dict) else set()
-        if not graphs or self._is_invalid_mode(solution_mode):
+        if not isinstance(ground_truth, dict) or self._is_invalid_mode(solution_mode):
             return False
         if ":" not in solution_mode:
             return False
         _, candidate = solution_mode.split(":", 1)
-        return candidate in graphs
+        data_source = self.data_source_bank.get(prompt_key)
+        if data_source == "3d":
+            valid_modes = ground_truth.get("structures", [])
+        elif data_source == "causal":
+            valid_modes = ground_truth.get("graphs", [])
+        else:
+            return False
+        return candidate in set(valid_modes)
 
     async def run_single(self, data: DataProto) -> dict[str, Any]:
         if "rollout_log_probs" not in data.batch:
@@ -665,7 +760,8 @@ class MultipleSolutionTTRLRewardManager(RewardManagerBase):
         valid_prompt_ids = prompt_ids[-valid_prompt_len:] if valid_prompt_len > 0 else prompt_ids[:0]
         prompt_key = self._prompt_key(valid_prompt_ids)
         prompt_text = self.tokenizer.decode(valid_prompt_ids, skip_special_tokens=True)
-        observations = self._extract_observations(prompt_text)
+        data_source = str(data.non_tensor_batch.get("data_source", [""] * len(data))[index])
+        observations = self._extract_observations(prompt_text, data_source)
         if self.method == "msttrl" and observations:
             # Keep bank keys stable even when actor prompts include prior predictions.
             prompt_key = self._prompt_key_from_observations(observations)
@@ -686,17 +782,19 @@ class MultipleSolutionTTRLRewardManager(RewardManagerBase):
 
         log_probs = data.batch["rollout_log_probs"][index]
         confidence = self._confidence(log_probs, valid_response_mask)
-        data_source = data.non_tensor_batch.get("data_source", [""] * len(data))[index]
         reward_model = data.non_tensor_batch.get("reward_model", [{}] * len(data))[index]
         ground_truth = reward_model.get("ground_truth", None) if isinstance(reward_model, dict) else None
-        task_reward_extra_info = await self._task_reward_extra_info(data, index, data_source, response_str, ground_truth)
+        task_reward_extra_info = await self._task_reward_extra_info(
+            data, index, data_source, response_str, ground_truth
+        )
         solution_mode = self._solution_mode(response_str, data_source, task_reward_extra_info)
 
         return {
             "prompt_key": prompt_key,
             "prompt_text": prompt_text,
+            "data_source": data_source,
             "observations": observations,
-            "ground_truth": self._format_ground_truth(ground_truth),
+            "ground_truth": self._format_ground_truth(ground_truth, data_source),
             "solution_mode": solution_mode,
             "final_answer": self._final_answer(response_str, data_source, task_reward_extra_info),
             "confidence": confidence,
@@ -753,9 +851,11 @@ class MultipleSolutionTTRLRewardManager(RewardManagerBase):
 
     @staticmethod
     def _solution_mode(response_str: str, data_source: Any, task_reward_extra_info: dict[str, Any]) -> str:
-        if str(data_source) == "causal" and "causal_pred" in task_reward_extra_info:
-            pred = task_reward_extra_info.get("causal_pred")
-            return "Graph:" + (str(pred) if pred else "<invalid>")
+        data_source = str(data_source)
+        prediction_key = {"causal": "causal_pred", "3d": "3d_pred"}.get(data_source)
+        if prediction_key is not None and prediction_key in task_reward_extra_info:
+            pred = task_reward_extra_info.get(prediction_key)
+            return f"{data_source}:" + (str(pred) if pred else "<invalid>")
         if "pred" in task_reward_extra_info:
             pred = task_reward_extra_info.get("pred")
             if pred is not None:
@@ -763,8 +863,21 @@ class MultipleSolutionTTRLRewardManager(RewardManagerBase):
         return f"{data_source}:" + response_str.strip()
 
     @staticmethod
-    def _extract_observations(prompt_text: str) -> list[str]:
-        return re.findall(r"Perturb\([^)]+\)\s*->\s*[^\n]+", prompt_text or "")
+    def _extract_observations(prompt_text: str, data_source: str) -> list[str]:
+        if data_source == "causal":
+            return re.findall(r"Perturb\([^)]+\)\s*->\s*[^\n]+", prompt_text or "")
+        if data_source == "3d":
+            observations = []
+            pattern = re.compile(
+                r"(?im)^\s*((?:top|front|back|left|right|side)\s+view"
+                r"\s*(?:\([^)\n]*\))?\s*:)\s*\n"
+                r"((?:\s*[01](?:[\s,]+[01]){2}\s*(?:\n|\Z)){3})"
+            )
+            for match in pattern.finditer(prompt_text or ""):
+                matrix = "\n".join(line.strip() for line in match.group(2).strip().splitlines())
+                observations.append(f"{match.group(1).strip()}\n{matrix}")
+            return observations
+        return []
 
     @staticmethod
     def _graph_from_solution_mode(solution_mode: str) -> str:
@@ -782,62 +895,53 @@ class MultipleSolutionTTRLRewardManager(RewardManagerBase):
         edges = [part.strip() for part in graph.split(",") if part.strip()]
         return ", ".join(edges)
 
-    @classmethod
-    def format_prior_block(cls, correct_modes: set[str] | list[str]) -> str:
-        """Format correct_set modes into the HypoSpace prior-hypothesis block."""
-        lines = []
-        for mode in sorted(correct_modes):
-            graph = cls._graph_from_solution_mode(mode)
-            if not graph or graph == "<invalid>":
-                continue
-            if graph == "No edges":
-                lines.append("Graph: No edges")
-            else:
-                edges = [part.strip() for part in graph.split(",") if part.strip()]
-                lines.append("Graph: " + ", ".join(edges))
-        return "\n".join(lines) if lines else "None"
-
-    def prior_block_for_observations(self, observations: list[str]) -> str:
-        if not observations:
-            return "None"
-        prompt_key = self._prompt_key_from_observations(observations)
-        return self.format_prior_block(self.solution_sets[prompt_key][SET_CORRECT])
+    @staticmethod
+    def _structure_from_solution_mode(solution_mode: str):
+        if ":" not in solution_mode:
+            return None
+        _, key = solution_mode.split(":", 1)
+        return _structure_from_key(key)
 
     @classmethod
-    def inject_prior_into_prompt_text(cls, prompt_text: str, prior_block: str) -> str:
-        """Insert or replace the prior-prediction section after Observations."""
-        prior_section = f"\n    {PRIOR_SECTION_HEADER}\n    {prior_block}\n"
-        if PRIOR_SECTION_PATTERN.search(prompt_text):
-            return PRIOR_SECTION_PATTERN.sub(prior_section, prompt_text, count=1)
+    def _format_candidate_structure(cls, solution_mode: str) -> str:
+        structure = cls._structure_from_solution_mode(solution_mode)
+        if structure is None:
+            return "<invalid>"
+        return _format_structure(structure)
 
-        for marker in ("\n    Task:", "\nTask:", "\n    Diversity rule:", "\nDiversity rule:"):
-            idx = prompt_text.find(marker)
-            if idx != -1:
-                return prompt_text[:idx] + prior_section + prompt_text[idx:]
-        return prompt_text + prior_section
-
-    def inject_prior_into_messages(self, messages: list[dict[str, str]]) -> list[dict[str, str]]:
-        if self.method != "msttrl" or not self.inject_prior_predictions:
-            return messages
-
-        updated = copy.deepcopy(messages)
-        for message in updated:
-            if message.get("role") != "user":
-                continue
-            content = message.get("content")
-            if not isinstance(content, str):
-                continue
-            observations = self._extract_observations(content)
-            prior_block = self.prior_block_for_observations(observations)
-            message["content"] = self.inject_prior_into_prompt_text(content, prior_block)
-        return updated
+    @classmethod
+    def _format_reconsider_candidate(cls, solution_mode: str, data_source: str) -> str:
+        if data_source != "3d":
+            return cls._format_candidate_graph(solution_mode)
+        structure = cls._structure_from_solution_mode(solution_mode)
+        if structure is None:
+            return "<invalid>"
+        layers = []
+        for layer_index, layer in enumerate(structure, start=1):
+            rows = "/".join(" ".join(str(value) for value in row) for row in layer)
+            layers.append(f"L{layer_index}={rows}")
+        return "; ".join(layers)
 
     @staticmethod
-    def _format_ground_truth(ground_truth: Any) -> dict[str, Any]:
+    def _format_ground_truth(ground_truth: Any, data_source: str) -> dict[str, Any]:
         if not isinstance(ground_truth, dict):
             return {}
 
         ground_truth_list = ground_truth.get("ground_truth_list", [])
+        if data_source == "3d":
+            structures = []
+            for item in ground_truth_list:
+                structure = _canonical_structure(item)
+                if structure is not None:
+                    structures.append(_structure_key(structure))
+            return {
+                "grid_size": ground_truth.get("grid_size"),
+                "max_height": ground_truth.get("max_height"),
+                "max_blocks": ground_truth.get("max_blocks"),
+                "num_structures": len(structures),
+                "structures": structures,
+            }
+
         graphs = []
         for graph in ground_truth_list:
             edges = graph.get("edges", []) if isinstance(graph, dict) else []
@@ -912,13 +1016,36 @@ class MultipleSolutionTTRLRewardManager(RewardManagerBase):
             meta_info={},
         )
 
-    def _verification_messages(self, prompt_text: str, solution_mode: str) -> list[dict[str, str]]:
-        observations = self._extract_observations(prompt_text[-VERIFIER_MAX_PROBLEM_CHARS:])
+    def _verification_messages(
+        self,
+        prompt_text: str,
+        solution_mode: str,
+        data_source: str,
+        ground_truth: dict[str, Any] | None = None,
+    ) -> list[dict[str, str]]:
+        observations = self._extract_observations(prompt_text, data_source)
+        if data_source == "3d":
+            ground_truth = ground_truth or {}
+            structure = self._structure_from_solution_mode(solution_mode)
+            grid_size = int(ground_truth.get("grid_size") or (len(structure[0]) if structure else 3))
+            max_height = int(ground_truth.get("max_height") or 3)
+            return [
+                {"role": "system", "content": THREE_D_VERIFIER_SYSTEM_PROMPT},
+                {
+                    "role": "user",
+                    "content": THREE_D_VERIFIER_USER_TEMPLATE.format(
+                        grid_size=grid_size,
+                        max_height=max_height,
+                        observations="\n".join(observations) if observations else "No observations found.",
+                        candidate=self._format_candidate_structure(solution_mode),
+                    ),
+                },
+            ]
         return [
-            {"role": "system", "content": VERIFIER_SYSTEM_PROMPT},
+            {"role": "system", "content": CAUSAL_VERIFIER_SYSTEM_PROMPT},
             {
                 "role": "user",
-                "content": VERIFIER_USER_TEMPLATE.format(
+                "content": CAUSAL_VERIFIER_USER_TEMPLATE.format(
                     observations="\n".join(observations) if observations else "No observations found.",
                     candidate=self._format_candidate_graph(solution_mode),
                 ),
@@ -951,8 +1078,9 @@ class MultipleSolutionTTRLRewardManager(RewardManagerBase):
 
     @staticmethod
     def _final_answer(response_str: str, data_source: Any, task_reward_extra_info: dict[str, Any]) -> str:
-        if str(data_source) == "causal" and "causal_pred" in task_reward_extra_info:
-            pred = task_reward_extra_info.get("causal_pred")
+        prediction_key = {"causal": "causal_pred", "3d": "3d_pred"}.get(str(data_source))
+        if prediction_key is not None and prediction_key in task_reward_extra_info:
+            pred = task_reward_extra_info.get(prediction_key)
             return str(pred) if pred else "<invalid>"
         if "pred" in task_reward_extra_info:
             pred = task_reward_extra_info.get("pred")

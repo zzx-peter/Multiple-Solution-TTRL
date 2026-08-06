@@ -3,7 +3,7 @@
 #PBS -q auto
 #PBS -N ttrl-causal
 #PBS -l select=1:ncpus=8:mem=64gb:ngpus=1
-#PBS -l walltime=03:00:00
+#PBS -l walltime=01:00:00
 #PBS -j oe
 
 set -e
@@ -17,4 +17,4 @@ trap 'rm -rf -- "$job_tmp"' EXIT
 apptainer exec --nv \
   --bind "$job_tmp:/tmp" \
   /scratch/Projects/CFP-04/CFP04-CF-024/ophv164/containers/verl-vllm017.sif \
-  bash examples/mode_collapse/ttrl/run_ttrl_causal.sh
+  bash examples/mode_collapse/ttrl/run_ttrl_3d.sh

@@ -577,6 +577,22 @@ class TestProcessValidationMetrics(unittest.TestCase):
         self.assertAlmostEqual(result["causal"]["causal_recovery"]["mean@2"], (1.0 + 1.0 / 16.0) / 2.0)
         self.assertAlmostEqual(result["causal"]["mode_recovery_rate"]["mean@2"], 2.0 / 17.0)
 
+    def test_process_validation_metrics_three_d_recovery(self):
+        """Test that 3D uses the same multi-solution recovery calculation."""
+        data_sources = ["3d", "3d", "3d"]
+        sample_inputs = ["prompt1", "prompt1", "prompt1"]
+        infos_dict = {
+            "acc": [1.0, 1.0, 0.0],
+            "3d_pred": ["structure-a", "structure-b", "structure-c"],
+            "3d_valid": [1.0, 1.0, 0.0],
+            "3d_n_ground_truths": [3, 3, 3],
+        }
+
+        result = process_validation_metrics(data_sources, sample_inputs, infos_dict, seed=42)
+
+        self.assertAlmostEqual(result["3d"]["3d_recovery"]["mean@3"], 2.0 / 3.0)
+        self.assertAlmostEqual(result["3d"]["mode_recovery_rate"]["mean@3"], 2.0 / 3.0)
+
 
 if __name__ == "__main__":
     unittest.main()

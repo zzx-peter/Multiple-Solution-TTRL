@@ -6,8 +6,8 @@ export RAY_EXPERIMENTAL_NOSET_CUDA_VISIBLE_DEVICES=1
 export WANDB_API_KEY="3ad98c1a4043033c1a4ea70737ebb314a2f09ba0"
 export PYTHONPATH=/scratch/ophv164/code/verl-v0.8.0:$PYTHONPATH
 
-causal_path="/scratch/ophv164/data/hypespace/causal_reason/train.parquet"
-causal_test_path="/scratch/ophv164/data/hypespace/causal_reason/test.parquet"
+causal_path="/scratch/ophv164/data/hypespace/3d_reason/train.parquet"
+causal_test_path="/scratch/ophv164/data/hypespace/3d_reason/test.parquet"
 
 train_files="['$causal_path']"
 test_files="['$causal_test_path']"
@@ -75,7 +75,6 @@ python3 -m verl.trainer.main_ppo \
     +msttrl.high_threshold=0.875 \
     +msttrl.low_threshold=0.5 \
     +msttrl.verifier_n=8 \
-    +msttrl.inject_prior_predictions=False \
     +msttrl.dump_dir=${msttrl_dump_dir} \
     trainer.balance_batch=True \
     trainer.critic_warmup=0 \

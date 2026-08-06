@@ -20,6 +20,7 @@ This trainer supports model-agonistic model initialization with huggingface
 
 import json
 import os
+import re
 import uuid
 from collections import defaultdict
 from concurrent.futures import ThreadPoolExecutor
@@ -540,15 +541,42 @@ class RayPPOTrainer:
 
     @staticmethod
     def _extract_msttrl_observations(prompt: str) -> list[str]:
-        return [line.strip() for line in (prompt or "").splitlines() if line.strip().startswith("Perturb(")]
+        lines = (prompt or "").splitlines()
+        observations = [line.strip() for line in lines if line.strip().startswith("Perturb(")]
+        for index, line in enumerate(lines):
+            if not re.fullmatch(
+                r"(?:top|front|back|left|right|side)\s+view\s*(?:\([^)\n]*\))?\s*:",
+                line.strip(),
+                flags=re.IGNORECASE,
+            ):
+                continue
+            matrix = [row.strip() for row in lines[index + 1 : index + 4]]
+            if len(matrix) == 3 and all(len(row.split()) == 3 for row in matrix):
+                observations.append("\n".join([line.strip(), *matrix]))
+        return observations
 
     @staticmethod
     def _format_msttrl_ground_truth(ground_truth) -> dict[str, Any]:
         if not isinstance(ground_truth, dict):
             return {}
 
+        ground_truth_list = ground_truth.get("ground_truth_list", [])
+        if any(isinstance(item, dict) and "layers" in item for item in ground_truth_list):
+            structures = [
+                json.dumps(item.get("layers", []), separators=(",", ":"))
+                for item in ground_truth_list
+                if isinstance(item, dict)
+            ]
+            return {
+                "grid_size": ground_truth.get("grid_size"),
+                "max_height": ground_truth.get("max_height"),
+                "max_blocks": ground_truth.get("max_blocks"),
+                "num_structures": len(structures),
+                "structures": structures,
+            }
+
         graphs = []
-        for graph in ground_truth.get("ground_truth_list", []):
+        for graph in ground_truth_list:
             edges = graph.get("edges", []) if isinstance(graph, dict) else []
             canonical_edges = sorted({(str(src), str(dst)) for src, dst in edges})
             if canonical_edges:
@@ -588,6 +616,8 @@ class RayPPOTrainer:
         reward_models = _list_from_non_tensor("reward_model", default={})
         if all(answer == "" for answer in final_answers):
             final_answers = _list_from_non_tensor("causal_pred")
+        if all(answer == "" for answer in final_answers):
+            final_answers = _list_from_non_tensor("3d_pred")
         if all(answer == "" for answer in final_answers):
             final_answers = _list_from_non_tensor("pred")
 
@@ -647,6 +677,7 @@ class RayPPOTrainer:
             "total_correct": data.get("total_correct", 0),
             "total_candidate": data.get("total_candidate", 0),
             "total_wrong": data.get("total_wrong", 0),
+            "set_mode_correctness": data.get("set_mode_correctness", {}),
             "verifier_correct_set_accuracy": data.get("verifier_correct_set_accuracy", {}),
             "verifier_example": data.get("verifier_example"),
             "self_reconsider_failure_count": data.get("self_reconsider_failure_count", 0),
@@ -956,12 +987,12 @@ class RayPPOTrainer:
             for var_name, metric2val in var2metric2val.items():
                 n_max = max([int(name.split("@")[-1].split("/")[0]) for name in metric2val.keys()])
                 for metric_name, metric_val in metric2val.items():
-                    is_causal_core_metric = data_source == "causal" and var_name in (
-                        "causal_recovery",
+                    is_hypospace_core_metric = data_source in {"causal", "3d"} and var_name in (
+                        f"{data_source}_recovery",
                         "mode_recovery_rate",
                     )
                     if (
-                        (var_name == core_var or is_causal_core_metric)
+                        (var_name == core_var or is_hypospace_core_metric)
                         and any(metric_name.startswith(pfx) for pfx in ["mean", "maj", "best", "recovery"])
                         and (f"@{n_max}" in metric_name)
                     ):
@@ -1684,10 +1715,6 @@ class RayPPOTrainer:
                 ttrl_enabled = bool(ttrl_config.get("enable", False))
                 msttrl_config = self.config.get("msttrl", {})
                 msttrl_enabled = bool(msttrl_config.get("enable", False))
-                if msttrl_enabled and self.reward_loop_manager is not None:
-                    inject_prior = bool(msttrl_config.get("inject_prior_predictions", True))
-                    if inject_prior:
-                        gen_batch = self.reward_loop_manager.inject_msttrl_prior_predictions(gen_batch)
                 if ttrl_enabled and msttrl_enabled:
                     raise ValueError("ttrl.enable and msttrl.enable cannot be enabled at the same time.")
                 if msttrl_enabled and not self.config.actor_rollout_ref.rollout.calculate_log_probs:

@@ -34,7 +34,7 @@ offload=True
 project_name="mode_collapse"
 experiment_name="Qwen3-1.7B-causal-gated-ips-msttrl_lambda_${gated_ips_grpo_lambda}_high_${high_threshold}_self_reconside"
 msttrl_dump_dir="/scratch/Projects/CFP-04/CFP04-CF-024/ophv164/result/${project_name}/${experiment_name}"
-seed=1337
+seed=42
 
 main_model=/scratch/Projects/CFP-04/CFP04-CF-024/ophv164/model/Qwen3-1.7B
 
@@ -85,7 +85,6 @@ python3 -m verl.trainer.main_ppo \
     +msttrl.high_threshold=${high_threshold} \
     +msttrl.low_threshold=0.5 \
     +msttrl.verifier_n=8 \
-    +msttrl.inject_prior_predictions=False \
     +msttrl.dump_dir=${msttrl_dump_dir} \
     trainer.balance_batch=True \
     trainer.critic_warmup=0 \

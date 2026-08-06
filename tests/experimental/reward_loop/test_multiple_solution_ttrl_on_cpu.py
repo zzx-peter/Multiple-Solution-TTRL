@@ -149,46 +149,54 @@ def test_multiple_solution_ttrl_run_single_allows_agent_loop_placeholder():
     assert output == {"reward_score": 0.0, "reward_extra_info": {}}
 
 
-def test_msttrl_prior_block_from_correct_set():
-    manager = _make_manager()
-    observations = ["Perturb(A) -> A:0 B:1"]
-    prompt_key = manager._prompt_key_from_observations(observations)
-    manager.solution_sets[prompt_key][SET_CORRECT] = {"causal:A->B", "causal:C->D"}
-    prior = manager.prior_block_for_observations(observations)
-    assert prior == "Graph: A->B\nGraph: C->D"
+def test_set_mode_correctness_statistics_reports_each_set_purity():
+    solution_sets = [
+        {
+            "correct_set": [{"is_ground_truth": True}, {"is_ground_truth": False}],
+            "candidate_set": [{"is_ground_truth": True}],
+            "wrong_set": [{"is_ground_truth": False}, {"is_ground_truth": False}],
+        },
+        {
+            "correct_set": [{"is_ground_truth": True}],
+            "candidate_set": [],
+            "wrong_set": [{"is_ground_truth": True}],
+        },
+    ]
+
+    statistics = MultipleSolutionTTRLRewardManager._set_mode_correctness_statistics(solution_sets)
+
+    assert statistics["correct_set"] == {
+        "num_modes": 3,
+        "num_correct_modes": 2,
+        "num_incorrect_modes": 1,
+        "correct_mode_ratio": pytest.approx(2 / 3),
+        "incorrect_mode_ratio": pytest.approx(1 / 3),
+    }
+    assert statistics["candidate_set"] == {
+        "num_modes": 1,
+        "num_correct_modes": 1,
+        "num_incorrect_modes": 0,
+        "correct_mode_ratio": 1.0,
+        "incorrect_mode_ratio": 0.0,
+    }
+    assert statistics["wrong_set"] == {
+        "num_modes": 3,
+        "num_correct_modes": 1,
+        "num_incorrect_modes": 2,
+        "correct_mode_ratio": pytest.approx(1 / 3),
+        "incorrect_mode_ratio": pytest.approx(2 / 3),
+    }
 
 
-def test_msttrl_inject_prior_into_prompt_text():
-    manager = _make_manager()
-    observations = ["Perturb(A) -> A:0 B:1"]
-    prompt_key = manager._prompt_key_from_observations(observations)
-    manager.solution_sets[prompt_key][SET_CORRECT] = {"causal:A->B"}
+def test_set_mode_correctness_statistics_uses_none_for_empty_sets():
+    statistics = MultipleSolutionTTRLRewardManager._set_mode_correctness_statistics([])
 
-    base_prompt = """
-    Observations:
-    Perturb(A) -> A:0 B:1
-
-    Task:
-    Output a graph.
-    """.strip()
-    updated = manager.inject_prior_into_messages([{"role": "user", "content": base_prompt}])[0]["content"]
-    assert "Prior predictions (do not repeat if avoidable):" in updated
-    assert "Graph: A->B" in updated
-    assert updated.index("Graph: A->B") < updated.index("Task:")
-
-
-def test_msttrl_prior_defaults_to_none_for_unknown_prompt():
-    manager = _make_manager()
-    base_prompt = """
-    Observations:
-    Perturb(A) -> A:0 B:1
-
-    Task:
-    Output a graph.
-    """.strip()
-    updated = manager.inject_prior_into_messages([{"role": "user", "content": base_prompt}])[0]["content"]
-    assert "Prior predictions (do not repeat if avoidable):" in updated
-    assert "None" in updated
+    for set_statistics in statistics.values():
+        assert set_statistics["num_modes"] == 0
+        assert set_statistics["num_correct_modes"] == 0
+        assert set_statistics["num_incorrect_modes"] == 0
+        assert set_statistics["correct_mode_ratio"] is None
+        assert set_statistics["incorrect_mode_ratio"] is None
 
 
 def test_self_reconsider_boundary_modes_builds_prompt_and_moves_only_valid_modes():
@@ -198,6 +206,11 @@ def test_self_reconsider_boundary_modes_builds_prompt_and_moves_only_valid_modes
     Perturb(A) -> A:0 B:1 C:0 D:0
     Perturb(B) -> A:0 B:0 C:0 D:0
     """
+    manager.data_source_bank[prompt_key] = "causal"
+    manager.observation_bank[prompt_key] = [
+        "Perturb(A) -> A:0 B:1 C:0 D:0",
+        "Perturb(B) -> A:0 B:0 C:0 D:0",
+    ]
     manager.solution_sets[prompt_key][SET_CORRECT] = {
         "causal:A->B",
         "causal:A->B, B->C",
@@ -257,3 +270,92 @@ Suspicious Mode: A->B
     )
     assert manager.get_state()["self_reconsider_failure_count"] == 2
     assert manager.solution_sets[prompt_key]["candidate"] == {"causal:C->D"}
+
+
+def test_three_d_solution_mode_and_verifier_prompt_are_routed_by_task():
+    manager = MultipleSolutionTTRLRewardManager.__new__(MultipleSolutionTTRLRewardManager)
+    structure_key = "[[[1,0,0],[0,0,0],[0,0,0]],[[1,0,0],[0,0,0],[0,0,0]]]"
+    solution_mode = manager._solution_mode("", "3d", {"3d_pred": structure_key})
+    prompt = """
+Maximum allowed height: 3 layers.
+
+### OBSERVATION
+Top View (1=block visible, 0=empty):
+1 0 0
+0 0 0
+0 0 0
+"""
+
+    messages = manager._verification_messages(
+        prompt,
+        solution_mode,
+        "3d",
+        {"grid_size": 3, "max_height": 3, "max_blocks": 3},
+    )
+
+    assert solution_mode == f"3d:{structure_key}"
+    assert "3D block structures" in messages[0]["content"]
+    assert "Top View (1=block visible, 0=empty):" in messages[1]["content"]
+    assert "Layer 2:" in messages[1]["content"]
+    assert "projected Top View is exactly Layer 1" in messages[1]["content"]
+    assert "Mismatches:" in messages[1]["content"]
+    assert "if and only if" in messages[1]["content"]
+    assert "Compare all nine cells" in messages[1]["content"]
+    assert "at most 3 blocks in total" not in messages[1]["content"]
+    assert "causal graph" not in messages[1]["content"]
+
+
+def test_verifier_routing_uses_data_source_not_solution_mode_or_prompt_text():
+    manager = MultipleSolutionTTRLRewardManager.__new__(MultipleSolutionTTRLRewardManager)
+    prompt = """
+Perturb(A) -> A:0 B:1
+Top View (1=block visible, 0=empty):
+1 0 0
+0 0 0
+0 0 0
+"""
+
+    messages = manager._verification_messages(prompt, "3d:<invalid>", "causal")
+
+    assert "causal-graph" in messages[0]["content"]
+    assert "Perturb(A) -> A:0 B:1" in messages[1]["content"]
+    assert "3D block structure" not in messages[1]["content"]
+
+
+def test_invalid_three_d_mode_still_uses_three_d_verifier():
+    manager = MultipleSolutionTTRLRewardManager.__new__(MultipleSolutionTTRLRewardManager)
+    prompt = """
+Top View (1=block visible, 0=empty):
+1 0 0
+0 0 0
+0 0 0
+"""
+
+    messages = manager._verification_messages(
+        prompt,
+        "anything:<invalid>",
+        "3d",
+        {"grid_size": 3, "max_height": 3, "max_blocks": 3},
+    )
+
+    assert "3D block structures" in messages[0]["content"]
+    assert "Top View (1=block visible, 0=empty):" in messages[1]["content"]
+    assert "Candidate structure:\n<invalid>" in messages[1]["content"]
+
+
+def test_three_d_ground_truth_uses_canonical_structures():
+    manager = MultipleSolutionTTRLRewardManager.__new__(MultipleSolutionTTRLRewardManager)
+    ground_truth = {
+        "ground_truth_list": [
+            {
+                "grid_size": 3,
+                "layers": [
+                    [[1, 0, 0], [0, 0, 0], [0, 0, 0]],
+                ],
+            }
+        ],
+        "grid_size": 3,
+        "max_height": 3,
+    }
+    formatted = manager._format_ground_truth(ground_truth, "3d")
+    assert formatted["num_structures"] == 1

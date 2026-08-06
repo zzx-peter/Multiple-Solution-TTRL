@@ -220,12 +220,6 @@ class RewardLoopWorker:
         # instance that prepared the batch, so its pending state can be routed.
         return reward_manager.apply_verification_results(prompt_keys, solution_modes, verifier_outputs)
 
-    def inject_msttrl_prior_predictions(self, raw_prompts: list) -> list:
-        reward_manager = self._get_reward_manager("msttrl")
-        if not hasattr(reward_manager, "inject_prior_into_messages"):
-            return raw_prompts
-        return [reward_manager.inject_prior_into_messages(list(messages)) for messages in raw_prompts]
-
     async def _post_request(self, payload: dict, endpoint: str, max_retries: int = 16):
         url = f"http://{self.reward_router_address}/{endpoint}"
         last_exception = None
@@ -487,16 +481,6 @@ class RewardLoopManager:
                 prompt_keys, solution_modes, verifier_outputs, reward_manager_name
             )
         )
-
-    def inject_msttrl_prior_predictions(self, data: DataProto) -> DataProto:
-        if "raw_prompt" not in data.non_tensor_batch:
-            return data
-        if len(self.reward_loop_workers) != 1:
-            raise ValueError("MSTTRL prior injection requires reward.num_workers=1.")
-        raw_prompts = [list(messages) for messages in data.non_tensor_batch["raw_prompt"]]
-        updated = ray.get(self.reward_loop_workers[0].inject_msttrl_prior_predictions.remote(raw_prompts))
-        data.non_tensor_batch["raw_prompt"] = np.array(updated, dtype=object)
-        return data
 
     def _run_all(self, tasks: list[asyncio.Task]):
         async def run_all():

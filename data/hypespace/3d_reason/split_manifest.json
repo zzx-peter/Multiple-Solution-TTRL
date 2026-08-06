@@ -1,5 +1,5 @@
 {
-  "source": "/scratch/ophv164/data/_HypoSpace/3d/datasets/3d_complete.json",
+  "source": "/scratch/Projects/CFP-04/CFP04-CF-024/ophv164/msttrl-data/_HypoSpace/3d/datasets/3d_complete.json",
   "seed": 42,
   "n_train": 100,
   "n_test": 29,
