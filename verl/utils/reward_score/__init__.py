@@ -98,6 +98,10 @@ def default_compute_score(
         from . import three_d
 
         res = three_d.compute_score(solution_str, ground_truth)
+    elif data_source == "boolean":
+        from . import boolean
+
+        res = boolean.compute_score(solution_str, ground_truth)
     elif data_source in [
         "searchR1_nq",
         "searchR1_triviaqa",

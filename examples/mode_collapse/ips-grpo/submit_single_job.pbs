@@ -1,7 +1,7 @@
 #!/bin/bash
 #PBS -P CFP04-CF-024
 #PBS -q auto
-#PBS -N ips-grpo-causal
+#PBS -N ips-grpo
 #PBS -l select=1:ncpus=8:mem=64gb:ngpus=1
 #PBS -l walltime=01:00:00
 #PBS -j oe

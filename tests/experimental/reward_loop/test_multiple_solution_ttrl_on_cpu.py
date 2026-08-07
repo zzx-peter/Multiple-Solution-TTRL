@@ -12,6 +12,7 @@ from verl.experimental.reward_loop.reward_manager.multiple_solution_ttrl import 
     MultipleSolutionTTRLRewardManager,
     SET_CORRECT,
 )
+from verl.utils.reward_score.boolean import _expression_key, _parse_formula
 
 
 class ToyTokenizer:
@@ -359,3 +360,95 @@ def test_three_d_ground_truth_uses_canonical_structures():
     }
     formatted = manager._format_ground_truth(ground_truth, "3d")
     assert formatted["num_structures"] == 1
+
+
+def test_boolean_solution_mode_and_verifier_prompt_are_routed_by_task():
+    manager = MultipleSolutionTTRLRewardManager.__new__(MultipleSolutionTTRLRewardManager)
+    expression_key = _expression_key(_parse_formula("x AND y", max_depth=2))
+    solution_mode = manager._solution_mode("", "boolean", {"boolean_pred": expression_key})
+    prompt = """
+Observations (input -> output):
+(x=0, y=0) -> 0
+(x=1, y=1) -> 1
+"""
+
+    messages = manager._verification_messages(
+        prompt,
+        solution_mode,
+        "boolean",
+        {"variables": ["x", "y"], "operators": ["AND", "OR", "NOT"], "max_depth": 2},
+    )
+
+    assert solution_mode == f"boolean:{expression_key}"
+    assert "Boolean-expression" in messages[0]["content"]
+    assert "(x=0, y=0) -> 0" in messages[1]["content"]
+    assert "Candidate expression:\nx AND y" in messages[1]["content"]
+    assert "depth may be at most 2" in messages[1]["content"]
+    assert "Verification Result: True" in messages[1]["content"]
+    assert "causal graph" not in messages[1]["content"]
+    assert "3D block" not in messages[1]["content"]
+
+
+def test_boolean_verifier_routing_uses_data_source_not_solution_mode_text():
+    manager = MultipleSolutionTTRLRewardManager.__new__(MultipleSolutionTTRLRewardManager)
+    messages = manager._verification_messages(
+        "(x=0, y=0) -> 0",
+        "causal:A->B",
+        "boolean",
+        {"variables": ["x", "y"], "operators": ["AND", "OR", "NOT"], "max_depth": 2},
+    )
+
+    assert "Boolean-expression" in messages[0]["content"]
+    assert "Candidate expression:\n<invalid>" in messages[1]["content"]
+
+
+def test_boolean_ground_truth_and_set_membership_use_canonical_expressions():
+    manager = MultipleSolutionTTRLRewardManager.__new__(MultipleSolutionTTRLRewardManager)
+    ground_truth = {
+        "ground_truth_list": [{"formula": "y AND x"}, {"formula": "NOT x"}],
+        "variables": ["x", "y"],
+        "operators": ["AND", "OR", "NOT"],
+        "max_depth": 2,
+    }
+    formatted = manager._format_ground_truth(ground_truth, "boolean")
+    expression_key = _expression_key(_parse_formula("x AND y", max_depth=2))
+
+    assert formatted["num_expressions"] == 2
+    assert expression_key in formatted["expressions"]
+
+    manager.ground_truth_bank = {"prompt": formatted}
+    manager.data_source_bank = {"prompt": "boolean"}
+    assert manager._is_ground_truth_mode("prompt", f"boolean:{expression_key}")
+
+
+def test_boolean_self_reconsider_uses_boolean_prompt_and_exact_candidates():
+    manager = MultipleSolutionTTRLRewardManager.__new__(MultipleSolutionTTRLRewardManager)
+    prompt_key = "boolean-prompt"
+    modes = {
+        f"boolean:{_expression_key(_parse_formula(formula, max_depth=2))}"
+        for formula in ("x", "y", "x AND y")
+    }
+    manager.solution_sets = {
+        prompt_key: {SET_CORRECT: set(modes), "candidate": set(), "wrong": set()}
+    }
+    manager.data_source_bank = {prompt_key: "boolean"}
+    manager.observation_bank = {prompt_key: ["(x=0, y=0) -> 0", "(x=1, y=1) -> 1"]}
+    manager.ground_truth_bank = {
+        prompt_key: {"variables": ["x", "y"], "operators": ["AND", "OR", "NOT"], "max_depth": 2}
+    }
+    manager.reconsider_correct_ratio = 0.5
+    manager.epoch_self_reconsider_failure_count = 0
+
+    messages = manager._self_reconsider_boundary_modes(prompt_key)
+    assert "accepted Boolean expressions" in messages[1]["content"]
+    assert "(x=1, y=1) -> 1" in messages[1]["content"]
+    assert "Select the 2 most suspicious" in messages[1]["content"]
+
+    moved = manager._self_reconsider_boundary_modes(
+        prompt_key,
+        "Suspicious Mode: x\nSuspicious Mode: y",
+    )
+    assert len(moved) == 2
+    assert manager.solution_sets[prompt_key]["candidate"] == set(moved)
+    assert len(manager.solution_sets[prompt_key][SET_CORRECT]) == 1
+    assert manager.epoch_self_reconsider_failure_count == 0

@@ -10,6 +10,8 @@ import numpy as np
 import torch
 
 from verl import DataProto
+from verl.utils.reward_score.boolean import _expression_key, _format_expression
+from verl.utils.reward_score.boolean import _parse_prediction as _parse_boolean_prediction
 from verl.utils.reward_score.causal import _graph_key, _parse_prediction
 from verl.utils.reward_score.three_d import _parse_prediction as _parse_3d_prediction
 from verl.utils.reward_score.three_d import _structure_key
@@ -92,6 +94,8 @@ def _majority_vote(
         return _majority_vote_causal(model_outputs, original_gt, num_ans=num_ans)
     if data_source == "3d":
         return _majority_vote_3d(model_outputs, original_gt, num_ans=num_ans)
+    if data_source == "boolean":
+        return _majority_vote_boolean(model_outputs, original_gt, num_ans=num_ans)
     raise NotImplementedError(f"TTRL majority voting is not implemented for data_source={data_source!r}")
 
 
@@ -183,5 +187,49 @@ def _make_3d_ground_truth(
             "layers": [[list(row) for row in layer] for layer in structure],
         }
         for structure in structures
+    ]
+    return pseudo_gt
+
+
+def _majority_vote_boolean(
+    model_outputs: list[str],
+    original_gt: Any,
+    num_ans: int = 1,
+) -> tuple[dict[str, Any], list[str], float]:
+    variables = original_gt.get("variables", ["x", "y"]) if isinstance(original_gt, dict) else ["x", "y"]
+    operators = (
+        original_gt.get("operators", ["AND", "OR", "NOT"])
+        if isinstance(original_gt, dict)
+        else ["AND", "OR", "NOT"]
+    )
+    max_depth = original_gt.get("max_depth") if isinstance(original_gt, dict) else None
+
+    predictions = []
+    for output in model_outputs:
+        prediction = _parse_boolean_prediction(
+            output,
+            variables=variables,
+            operators=operators,
+            max_depth=max_depth,
+        )
+        if prediction is not None:
+            predictions.append(prediction)
+    if not predictions:
+        return _make_boolean_ground_truth([], original_gt), [], 0.0
+
+    top_predictions = Counter(predictions).most_common(num_ans)
+    majority_ratio = top_predictions[0][1] / len(model_outputs)
+    majority_expressions = [expression for expression, _ in top_predictions]
+    return (
+        _make_boolean_ground_truth(majority_expressions, original_gt),
+        [_expression_key(expression) for expression in majority_expressions],
+        majority_ratio,
+    )
+
+
+def _make_boolean_ground_truth(expressions: list[tuple], original_gt: Any) -> dict[str, Any]:
+    pseudo_gt = dict(original_gt) if isinstance(original_gt, dict) else {}
+    pseudo_gt["ground_truth_list"] = [
+        {"formula": _format_expression(expression)} for expression in expressions
     ]
     return pseudo_gt

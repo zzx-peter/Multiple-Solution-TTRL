@@ -543,6 +543,15 @@ class RayPPOTrainer:
     def _extract_msttrl_observations(prompt: str) -> list[str]:
         lines = (prompt or "").splitlines()
         observations = [line.strip() for line in lines if line.strip().startswith("Perturb(")]
+        observations.extend(
+            line.strip()
+            for line in lines
+            if re.fullmatch(
+                r"\(\s*[A-Za-z_]\w*\s*=\s*[01]"
+                r"(?:\s*,\s*[A-Za-z_]\w*\s*=\s*[01])*\s*\)\s*->\s*[01]",
+                line.strip(),
+            )
+        )
         for index, line in enumerate(lines):
             if not re.fullmatch(
                 r"(?:top|front|back|left|right|side)\s+view\s*(?:\([^)\n]*\))?\s*:",
@@ -573,6 +582,20 @@ class RayPPOTrainer:
                 "max_blocks": ground_truth.get("max_blocks"),
                 "num_structures": len(structures),
                 "structures": structures,
+            }
+
+        if any(isinstance(item, dict) and "formula" in item for item in ground_truth_list):
+            expressions = [
+                str(item["formula"])
+                for item in ground_truth_list
+                if isinstance(item, dict) and item.get("formula") is not None
+            ]
+            return {
+                "variables": ground_truth.get("variables"),
+                "operators": ground_truth.get("operators"),
+                "max_depth": ground_truth.get("max_depth"),
+                "num_expressions": len(expressions),
+                "expressions": expressions,
             }
 
         graphs = []
@@ -618,6 +641,8 @@ class RayPPOTrainer:
             final_answers = _list_from_non_tensor("causal_pred")
         if all(answer == "" for answer in final_answers):
             final_answers = _list_from_non_tensor("3d_pred")
+        if all(answer == "" for answer in final_answers):
+            final_answers = _list_from_non_tensor("boolean_pred")
         if all(answer == "" for answer in final_answers):
             final_answers = _list_from_non_tensor("pred")
 
@@ -987,7 +1012,7 @@ class RayPPOTrainer:
             for var_name, metric2val in var2metric2val.items():
                 n_max = max([int(name.split("@")[-1].split("/")[0]) for name in metric2val.keys()])
                 for metric_name, metric_val in metric2val.items():
-                    is_hypospace_core_metric = data_source in {"causal", "3d"} and var_name in (
+                    is_hypospace_core_metric = data_source in {"causal", "3d", "boolean"} and var_name in (
                         f"{data_source}_recovery",
                         "mode_recovery_rate",
                     )

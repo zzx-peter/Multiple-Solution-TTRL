@@ -593,6 +593,22 @@ class TestProcessValidationMetrics(unittest.TestCase):
         self.assertAlmostEqual(result["3d"]["3d_recovery"]["mean@3"], 2.0 / 3.0)
         self.assertAlmostEqual(result["3d"]["mode_recovery_rate"]["mean@3"], 2.0 / 3.0)
 
+    def test_process_validation_metrics_boolean_recovery(self):
+        """Test that Boolean expressions use the shared mode-recovery calculation."""
+        data_sources = ["boolean", "boolean", "boolean", "boolean"]
+        sample_inputs = ["prompt1", "prompt1", "prompt1", "prompt1"]
+        infos_dict = {
+            "acc": [1.0, 1.0, 0.0, 1.0],
+            "boolean_pred": ["expression-a", "expression-b", "expression-c", "expression-a"],
+            "boolean_valid": [1.0, 1.0, 0.0, 1.0],
+            "boolean_n_ground_truths": [4, 4, 4, 4],
+        }
+
+        result = process_validation_metrics(data_sources, sample_inputs, infos_dict, seed=42)
+
+        self.assertAlmostEqual(result["boolean"]["boolean_recovery"]["mean@4"], 0.5)
+        self.assertAlmostEqual(result["boolean"]["mode_recovery_rate"]["mean@4"], 0.5)
+
 
 if __name__ == "__main__":
     unittest.main()

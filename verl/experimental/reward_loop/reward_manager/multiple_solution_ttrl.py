@@ -18,6 +18,13 @@ from verl import DataProto
 from verl.experimental.reward_loop.reward_manager import register
 from verl.experimental.reward_loop.reward_manager.base import RewardManagerBase
 from verl.utils.reward_score import default_compute_score
+from verl.utils.reward_score.boolean import (
+    _expression_from_key,
+    _expression_key,
+    _format_expression,
+    _ground_truth_expression,
+    _parse_formula,
+)
 from verl.utils.reward_score.three_d import (
     _canonical_structure,
     _format_structure,
@@ -100,6 +107,35 @@ Verification Result: True or False
 The result is True if and only if the structural check passes and Mismatches is None.
 """
 
+BOOLEAN_VERIFIER_SYSTEM_PROMPT = "You are a rigorous verifier for Boolean-expression candidates."
+
+BOOLEAN_VERIFIER_USER_TEMPLATE = """Verify whether the candidate Boolean expression explains the observations.
+
+Rules:
+- Use only the variables: {variables}
+- Use only the operators: {operators}
+- The expression depth may be at most {max_depth}
+- Boolean constants are not allowed.
+- NOT flips 0 and 1. AND is 1 only when both inputs are 1. OR is 1 when at least one input is 1.
+- Reordering AND/OR inputs, removing duplicate identical AND/OR inputs, and regrouping repeated
+  ANDs or repeated ORs do not create a new expression. Do not apply other algebraic transformations.
+
+Boolean observations:
+{observations}
+
+Candidate expression:
+{candidate}
+
+First check the variables, operators, constants, and depth. Then substitute every observed input into
+the candidate and compare the computed output with the observed output. Judge only this candidate;
+multiple different expressions may be valid.
+
+Provide a short evaluation, then end with exactly one line:
+Verification Result: True
+or
+Verification Result: False
+"""
+
 CAUSAL_RECONSIDER_SYSTEM_PROMPT = "You are a rigorous verifier for causal-graph candidates."
 
 CAUSAL_RECONSIDER_USER_TEMPLATE = """Select the {count} most suspicious candidates from the accepted causal graphs.
@@ -139,6 +175,33 @@ Accepted candidates (each candidate is a single canonical line):
 Return exactly {count} lines, copied exactly from the accepted candidates, in this format:
 Suspicious Mode: <candidate>
 """
+
+BOOLEAN_RECONSIDER_SYSTEM_PROMPT = "You are a rigorous verifier for Boolean-expression candidates."
+
+BOOLEAN_RECONSIDER_USER_TEMPLATE = """\
+Select the {count} most suspicious candidates from the accepted Boolean expressions.
+
+Rules:
+- Use only the variables: {variables}
+- Use only the operators: {operators}
+- The expression depth may be at most {max_depth}, and Boolean constants are not allowed.
+- Evaluate each candidate on every observation; any disagreement makes that candidate suspicious.
+
+Boolean observations:
+{observations}
+
+Accepted candidates:
+{candidates}
+
+Return exactly {count} lines, copied exactly from the accepted candidates, in this format:
+Suspicious Mode: <candidate>
+"""
+
+TASK_PREDICTION_KEYS = {
+    "causal": "causal_pred",
+    "3d": "3d_pred",
+    "boolean": "boolean_pred",
+}
 
 SET_CORRECT = "correct"
 SET_CANDIDATE = "candidate"
@@ -527,6 +590,17 @@ class MultipleSolutionTTRLRewardManager(RewardManagerBase):
                     observations="\n".join(observations) if observations else "No observations found.",
                     candidates=candidates,
                 )
+            elif data_source == "boolean":
+                ground_truth = self.ground_truth_bank.get(prompt_key, {})
+                system_prompt = BOOLEAN_RECONSIDER_SYSTEM_PROMPT
+                user_prompt = BOOLEAN_RECONSIDER_USER_TEMPLATE.format(
+                    count=count,
+                    variables=", ".join(ground_truth.get("variables", ["x", "y"])),
+                    operators=", ".join(ground_truth.get("operators", ["AND", "OR", "NOT"])),
+                    max_depth=ground_truth.get("max_depth", 2),
+                    observations="\n".join(observations) if observations else "No observations found.",
+                    candidates=candidates,
+                )
             else:
                 system_prompt = CAUSAL_RECONSIDER_SYSTEM_PROMPT
                 user_prompt = CAUSAL_RECONSIDER_USER_TEMPLATE.format(
@@ -739,6 +813,8 @@ class MultipleSolutionTTRLRewardManager(RewardManagerBase):
             valid_modes = ground_truth.get("structures", [])
         elif data_source == "causal":
             valid_modes = ground_truth.get("graphs", [])
+        elif data_source == "boolean":
+            valid_modes = ground_truth.get("expressions", [])
         else:
             return False
         return candidate in set(valid_modes)
@@ -852,7 +928,7 @@ class MultipleSolutionTTRLRewardManager(RewardManagerBase):
     @staticmethod
     def _solution_mode(response_str: str, data_source: Any, task_reward_extra_info: dict[str, Any]) -> str:
         data_source = str(data_source)
-        prediction_key = {"causal": "causal_pred", "3d": "3d_pred"}.get(data_source)
+        prediction_key = TASK_PREDICTION_KEYS.get(data_source)
         if prediction_key is not None and prediction_key in task_reward_extra_info:
             pred = task_reward_extra_info.get(prediction_key)
             return f"{data_source}:" + (str(pred) if pred else "<invalid>")
@@ -877,6 +953,12 @@ class MultipleSolutionTTRLRewardManager(RewardManagerBase):
                 matrix = "\n".join(line.strip() for line in match.group(2).strip().splitlines())
                 observations.append(f"{match.group(1).strip()}\n{matrix}")
             return observations
+        if data_source == "boolean":
+            pattern = re.compile(
+                r"(?im)^\s*\(\s*[A-Za-z_]\w*\s*=\s*[01]"
+                r"(?:\s*,\s*[A-Za-z_]\w*\s*=\s*[01])*\s*\)\s*->\s*[01]\s*$"
+            )
+            return [match.group(0).strip() for match in pattern.finditer(prompt_text or "")]
         return []
 
     @staticmethod
@@ -909,18 +991,32 @@ class MultipleSolutionTTRLRewardManager(RewardManagerBase):
             return "<invalid>"
         return _format_structure(structure)
 
+    @staticmethod
+    def _expression_from_solution_mode(solution_mode: str):
+        if ":" not in solution_mode:
+            return None
+        _, key = solution_mode.split(":", 1)
+        return _expression_from_key(key)
+
+    @classmethod
+    def _format_candidate_expression(cls, solution_mode: str) -> str:
+        expression = cls._expression_from_solution_mode(solution_mode)
+        return _format_expression(expression) if expression is not None else "<invalid>"
+
     @classmethod
     def _format_reconsider_candidate(cls, solution_mode: str, data_source: str) -> str:
-        if data_source != "3d":
-            return cls._format_candidate_graph(solution_mode)
-        structure = cls._structure_from_solution_mode(solution_mode)
-        if structure is None:
-            return "<invalid>"
-        layers = []
-        for layer_index, layer in enumerate(structure, start=1):
-            rows = "/".join(" ".join(str(value) for value in row) for row in layer)
-            layers.append(f"L{layer_index}={rows}")
-        return "; ".join(layers)
+        if data_source == "3d":
+            structure = cls._structure_from_solution_mode(solution_mode)
+            if structure is None:
+                return "<invalid>"
+            layers = []
+            for layer_index, layer in enumerate(structure, start=1):
+                rows = "/".join(" ".join(str(value) for value in row) for row in layer)
+                layers.append(f"L{layer_index}={rows}")
+            return "; ".join(layers)
+        if data_source == "boolean":
+            return cls._format_candidate_expression(solution_mode)
+        return cls._format_candidate_graph(solution_mode)
 
     @staticmethod
     def _format_ground_truth(ground_truth: Any, data_source: str) -> dict[str, Any]:
@@ -940,6 +1036,32 @@ class MultipleSolutionTTRLRewardManager(RewardManagerBase):
                 "max_blocks": ground_truth.get("max_blocks"),
                 "num_structures": len(structures),
                 "structures": structures,
+            }
+
+        if data_source == "boolean":
+            variables = list(ground_truth.get("variables", ["x", "y"]))
+            operators = list(ground_truth.get("operators", ["AND", "OR", "NOT"]))
+            max_depth = int(ground_truth.get("max_depth", 2))
+            expressions = set()
+            for item in ground_truth_list:
+                formula = _ground_truth_expression(item)
+                if formula is None:
+                    continue
+                expression = _parse_formula(
+                    formula,
+                    variables=variables,
+                    operators=operators,
+                    max_depth=max_depth,
+                )
+                if expression is not None:
+                    expressions.add(_expression_key(expression))
+            return {
+                "variables": variables,
+                "operators": operators,
+                "max_depth": max_depth,
+                "mechanistic_opts": ground_truth.get("mechanistic_opts", {}),
+                "num_expressions": len(expressions),
+                "expressions": sorted(expressions),
             }
 
         graphs = []
@@ -1041,6 +1163,21 @@ class MultipleSolutionTTRLRewardManager(RewardManagerBase):
                     ),
                 },
             ]
+        if data_source == "boolean":
+            ground_truth = ground_truth or {}
+            return [
+                {"role": "system", "content": BOOLEAN_VERIFIER_SYSTEM_PROMPT},
+                {
+                    "role": "user",
+                    "content": BOOLEAN_VERIFIER_USER_TEMPLATE.format(
+                        variables=", ".join(ground_truth.get("variables", ["x", "y"])),
+                        operators=", ".join(ground_truth.get("operators", ["AND", "OR", "NOT"])),
+                        max_depth=ground_truth.get("max_depth", 2),
+                        observations="\n".join(observations) if observations else "No observations found.",
+                        candidate=self._format_candidate_expression(solution_mode),
+                    ),
+                },
+            ]
         return [
             {"role": "system", "content": CAUSAL_VERIFIER_SYSTEM_PROMPT},
             {
@@ -1078,7 +1215,7 @@ class MultipleSolutionTTRLRewardManager(RewardManagerBase):
 
     @staticmethod
     def _final_answer(response_str: str, data_source: Any, task_reward_extra_info: dict[str, Any]) -> str:
-        prediction_key = {"causal": "causal_pred", "3d": "3d_pred"}.get(str(data_source))
+        prediction_key = TASK_PREDICTION_KEYS.get(str(data_source))
         if prediction_key is not None and prediction_key in task_reward_extra_info:
             pred = task_reward_extra_info.get(prediction_key)
             return str(pred) if pred else "<invalid>"

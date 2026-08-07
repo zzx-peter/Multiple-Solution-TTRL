@@ -304,6 +304,30 @@ def test_ips_grpo_scales_rewards_by_group_trajectory_frequency():
     assert torch.allclose(ret, expected)
 
 
+def test_ips_grpo_uses_boolean_prediction_for_mode_frequency():
+    token_level_rewards = torch.ones((4, 1), dtype=torch.float32)
+    response_mask = torch.ones_like(token_level_rewards)
+    responses = torch.tensor([[10], [10], [10], [10]])
+    index = np.array(["prompt-a"] * 4, dtype=object)
+    non_tensor_batch = {
+        "boolean_pred": np.array(["a", "a", "b", "c"], dtype=object),
+    }
+
+    adv, ret = compute_ips_grpo_outcome_advantage(
+        token_level_rewards=token_level_rewards,
+        response_mask=response_mask,
+        index=index,
+        responses=responses,
+        non_tensor_batch=non_tensor_batch,
+        norm_adv_by_std_in_grpo=False,
+        config={"ips_grpo_debug_print_answers": False},
+    )
+
+    expected = torch.tensor([[-1.0], [-1.0], [1.0], [1.0]], dtype=torch.float32)
+    assert torch.allclose(adv, expected)
+    assert torch.allclose(ret, expected)
+
+
 def test_ips_grpo_clips_extreme_low_trajectory_probability():
     token_level_rewards = torch.tensor([[1.0], [2.0], [3.0], [4.0]], dtype=torch.float32)
     response_mask = torch.ones_like(token_level_rewards)
