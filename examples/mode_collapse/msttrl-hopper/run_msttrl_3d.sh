@@ -31,7 +31,7 @@ gpu_memory_utilization=0.5
 offload=True
 
 project_name="mode_collapse"
-experiment_name="Qwen3-1.7B-3d-gated-ips-msttrl_lambda_${gated_ips_grpo_lambda}_high_${high_threshold}_self_reconsider"
+experiment_name="Qwen3-1.7B-3d-gated-ips-msttrl_lambda_${gated_ips_grpo_lambda}_high_${high_threshold}_self_reconside3"
 msttrl_dump_dir="/scratch/Projects/CFP-04/CFP04-CF-024/ophv164/result/${project_name}/${experiment_name}"
 seed=1337
 
@@ -93,7 +93,7 @@ python3 -m verl.trainer.main_ppo \
     trainer.experiment_name=${experiment_name} \
     trainer.n_gpus_per_node=${n_gpus_per_node} \
     trainer.nnodes=1 \
-    trainer.save_freq=-1 \
+    trainer.save_freq=500 \
     trainer.test_freq=5 \
     trainer.total_epochs=20 \
     trainer.log_val_generations=10 \

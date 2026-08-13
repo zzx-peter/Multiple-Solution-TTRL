@@ -1,5 +1,8 @@
 #!/bin/bash
 set -x
+
+ttrl_num_ans="${TTRL_NUM_ANS:-1}"
+
 export CUDA_VISIBLE_DEVICES=0
 export RAY_EXPERIMENTAL_NOSET_CUDA_VISIBLE_DEVICES=1
 export WANDB_API_KEY="3ad98c1a4043033c1a4ea70737ebb314a2f09ba0"
@@ -27,7 +30,7 @@ seed=1337
 main_model=/scratch/Projects/CFP-04/CFP04-CF-024/ophv164/model/Qwen3-1.7B
 
 python3 -m verl.trainer.main_ppo \
-    algorithm.adv_estimator=grpo \
+    algorithm.adv_estimator=ips_grpo \
     algorithm.norm_adv_by_std_in_grpo=True \
     actor_rollout_ref.actor.policy_loss.loss_mode=vanilla \
     data.train_files="${train_files}" \
@@ -68,7 +71,7 @@ python3 -m verl.trainer.main_ppo \
     algorithm.kl_ctrl.kl_coef=0.0 \
     reward.num_workers=1 \
     +ttrl.enable=True \
-    +ttrl.num_ans=1 \
+    +ttrl.num_ans=${ttrl_num_ans} \
     trainer.balance_batch=True \
     trainer.critic_warmup=0 \
     trainer.logger='["tensorboard","wandb"]' \
@@ -81,4 +84,5 @@ python3 -m verl.trainer.main_ppo \
     trainer.test_freq=5 \
     trainer.total_epochs=30 \
     trainer.log_val_generations=10 \
-    trainer.default_local_dir=/scratch/ophv164/result/${project_name}/${experiment_name}$@
+    trainer.default_local_dir=/scratch/ophv164/result/${project_name}/${experiment_name} \
+    "$@"
