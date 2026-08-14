@@ -3,7 +3,7 @@
 #PBS -q auto
 #PBS -N msttrl-causal
 #PBS -l select=1:ncpus=8:mem=64gb:ngpus=1
-#PBS -l walltime=08:00:00
+#PBS -l walltime=05:00:00
 #PBS -j oe
 
 set -e

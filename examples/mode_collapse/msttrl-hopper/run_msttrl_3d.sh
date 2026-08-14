@@ -11,6 +11,11 @@ if (( $# > 0 )); then
     shift
 fi
 
+seed="${1:-1337}"
+if (( $# > 0 )); then
+    shift
+fi
+
 export CUDA_VISIBLE_DEVICES=0
 export RAY_EXPERIMENTAL_NOSET_CUDA_VISIBLE_DEVICES=1
 export WANDB_API_KEY="3ad98c1a4043033c1a4ea70737ebb314a2f09ba0"
@@ -31,9 +36,8 @@ gpu_memory_utilization=0.5
 offload=True
 
 project_name="mode_collapse"
-experiment_name="Qwen3-1.7B-3d-gated-ips-msttrl_lambda_${gated_ips_grpo_lambda}_high_${high_threshold}_self_reconside3"
+experiment_name="Qwen3-1.7B-3d-gated-ips-msttrl_lambda_${gated_ips_grpo_lambda}_high_${high_threshold}_seed_${seed}"
 msttrl_dump_dir="/scratch/Projects/CFP-04/CFP04-CF-024/ophv164/result/${project_name}/${experiment_name}"
-seed=1337
 
 main_model=/scratch/Projects/CFP-04/CFP04-CF-024/ophv164/model/Qwen3-1.7B
 

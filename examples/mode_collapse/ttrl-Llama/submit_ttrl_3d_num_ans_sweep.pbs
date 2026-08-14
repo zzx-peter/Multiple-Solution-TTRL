@@ -1,0 +1,33 @@
+#!/bin/bash
+#PBS -P CFP04-CF-024
+#PBS -q auto
+#PBS -N ttrl-3d-num-ans
+#PBS -l select=1:ncpus=8:mem=64gb:ngpus=1
+#PBS -l walltime=03:00:00
+#PBS -j oe
+
+set -e
+module load apptainer/1.3.1
+
+repo_dir=/scratch/Projects/CFP-04/CFP04-CF-024/ophv164/code/Multiple-Solution-TTRL
+container=/scratch/Projects/CFP-04/CFP04-CF-024/ophv164/containers/verl-vllm017.sif
+result_root=/scratch/ophv164/result/mode_collapse
+
+cd "$repo_dir"
+
+job_tmp="$(mktemp -d "/tmp/verl-${PBS_JOBID}.XXXXXX")"
+trap 'rm -rf -- "$job_tmp"' EXIT
+
+for num_ans in 2 3 4; do
+    experiment_name="Qwen3-1.7B-3d-reason-ttrl-num-ans-${num_ans}"
+    run_tmp="${job_tmp}/num-ans-${num_ans}"
+    mkdir -p "$run_tmp"
+
+    apptainer exec --nv \
+        --bind "$run_tmp:/tmp" \
+        "$container" \
+        env TTRL_NUM_ANS="$num_ans" \
+        bash examples/mode_collapse/ttrl/run_ttrl_3d.sh \
+        "trainer.experiment_name=${experiment_name}" \
+        "trainer.default_local_dir=${result_root}/${experiment_name}"
+done

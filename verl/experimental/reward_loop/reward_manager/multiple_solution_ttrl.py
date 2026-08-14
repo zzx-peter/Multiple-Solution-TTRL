@@ -5,7 +5,6 @@
 
 import hashlib
 import inspect
-import math
 import re
 from collections import Counter, defaultdict
 from typing import Any
@@ -136,67 +135,6 @@ or
 Verification Result: False
 """
 
-CAUSAL_RECONSIDER_SYSTEM_PROMPT = "You are a rigorous verifier for causal-graph candidates."
-
-CAUSAL_RECONSIDER_USER_TEMPLATE = """Select the {count} most suspicious candidates from the accepted causal graphs.
-
-Rules:
-- When a node is perturbed, it is 0.
-- Its downstream descendants are 1; all other nodes are 0.
-- Follow edges only from left to right.
-- A graph may have at most 6 edges.
-
-Perturbation observations:
-{observations}
-
-Accepted candidates:
-{candidates}
-
-Return exactly {count} lines, copied exactly from the accepted candidates, in this format:
-Suspicious Mode: <candidate>
-"""
-
-THREE_D_RECONSIDER_SYSTEM_PROMPT = "You are a rigorous verifier for 3D block-structure candidates."
-
-THREE_D_RECONSIDER_USER_TEMPLATE = """Select the {count} most suspicious candidates from the accepted 3D structures.
-
-Rules:
-- Each candidate consists of consecutive {grid_size}x{grid_size} binary layers from bottom to top.
-- Every block above Layer 1 must be supported directly from below.
-- A top-view cell is 1 exactly when its vertical stack contains at least one block.
-- The structure may have at most {max_height} layers.
-
-3D observations:
-{observations}
-
-Accepted candidates (each candidate is a single canonical line):
-{candidates}
-
-Return exactly {count} lines, copied exactly from the accepted candidates, in this format:
-Suspicious Mode: <candidate>
-"""
-
-BOOLEAN_RECONSIDER_SYSTEM_PROMPT = "You are a rigorous verifier for Boolean-expression candidates."
-
-BOOLEAN_RECONSIDER_USER_TEMPLATE = """\
-Select the {count} most suspicious candidates from the accepted Boolean expressions.
-
-Rules:
-- Use only the variables: {variables}
-- Use only the operators: {operators}
-- The expression depth may be at most {max_depth}, and Boolean constants are not allowed.
-- Evaluate each candidate on every observation; any disagreement makes that candidate suspicious.
-
-Boolean observations:
-{observations}
-
-Accepted candidates:
-{candidates}
-
-Return exactly {count} lines, copied exactly from the accepted candidates, in this format:
-Suspicious Mode: <candidate>
-"""
-
 TASK_PREDICTION_KEYS = {
     "causal": "causal_pred",
     "3d": "3d_pred",
@@ -248,11 +186,6 @@ class MultipleSolutionTTRLRewardManager(RewardManagerBase):
         self.verifier_n = int(_read_cfg(config, "verifier_n", 8))
         self.high_threshold = float(_read_cfg(config, "high_threshold", 0.875))
         self.low_threshold = float(_read_cfg(config, "low_threshold", 0.5))
-        # Fraction of each boundary set reconsidered after a reward update.
-        # These can be overridden through msttrl/reward_kwargs while debugging;
-        # no launcher-script arguments are required.
-        self.reconsider_correct_ratio = float(_read_cfg(config, "reconsider_correct_ratio", 0.3))
-        self.reconsider_wrong_ratio = float(_read_cfg(config, "reconsider_wrong_ratio", 0.1))
         self.verifier_max_prompt_length = min(
             int(config.data.max_prompt_length),
             int(config.actor_rollout_ref.rollout.prompt_length),
@@ -262,20 +195,14 @@ class MultipleSolutionTTRLRewardManager(RewardManagerBase):
         self.apply_chat_template_kwargs = dict(config.data.get("apply_chat_template_kwargs", {}))
         if self.low_threshold > self.high_threshold:
             raise ValueError("msttrl.low_threshold must be <= msttrl.high_threshold.")
-        for name, ratio in (
-            ("reconsider_correct_ratio", self.reconsider_correct_ratio),
-            ("reconsider_wrong_ratio", self.reconsider_wrong_ratio),
-        ):
-            if not 0.0 <= ratio <= 1.0:
-                raise ValueError(f"msttrl.{name} must be between 0 and 1, got {ratio}.")
         # Counts how often each prompt emits each valid solution mode across
-        # training batches. This is used for inspection and boundary-mode moves.
+        # training batches. This is used for inspection and history weighting.
         self.memory_bank: dict[str, Counter[str]] = defaultdict(Counter)
         # Stores prompt text by prompt hash so later verifier prompts can be
         # built from compact prompt keys carried through the rollout batch.
         self.prompt_bank: dict[str, str] = {}
         # Dataset type is stored beside each prompt so asynchronous verifier
-        # and reconsideration requests use task-specific formatting.
+        # requests use task-specific formatting.
         self.data_source_bank: dict[str, str] = {}
         # Stores compact debug-only problem fields for JSON dumps.
         self.observation_bank: dict[str, list[str]] = {}
@@ -291,8 +218,6 @@ class MultipleSolutionTTRLRewardManager(RewardManagerBase):
         )
         # Latest verifier pass rate p_t(z) for candidate modes.
         self.plausibility_bank: dict[str, dict[str, float]] = defaultdict(dict)
-        # Last summed reward per prompt; increases trigger a boundary refresh.
-        self.last_reward_sum: dict[str, float] = {}
         # Two-stage handshake with the trainer: prepare_verification_batch()
         # extracts and caches rollout rows, apply_verification_results() routes
         # modes, and run_batch() then reuses the same rows to emit rewards.
@@ -305,9 +230,6 @@ class MultipleSolutionTTRLRewardManager(RewardManagerBase):
         self.epoch_verifier_correct_count = 0
         self.epoch_verifier_correct_ground_truth_count = 0
         self.epoch_verifier_example: dict[str, Any] | None = None
-        # Number of self-reconsider responses in the current epoch that contain
-        # invalid selections or do not provide exactly the requested count.
-        self.epoch_self_reconsider_failure_count = 0
 
     async def run_batch(self, data: DataProto) -> list[dict[str, Any]]:
         # During normal MSTTRL training the verifier path prepares rows first.
@@ -318,12 +240,7 @@ class MultipleSolutionTTRLRewardManager(RewardManagerBase):
             self.pending_rows = None
         else:
             rows = await self._prepare_rows(data)
-        outputs = self._build_outputs(rows)
-        # Validation batches should be scored against the current memory only;
-        # they must not change solution sets or future training rewards.
-        if self.method == "msttrl" and not any(row.get("validate", False) for row in rows):
-            self._maintain_sets(rows, outputs)
-        return outputs
+        return self._build_outputs(rows)
 
     async def prepare_verification_batch(self, data: DataProto) -> dict[str, Any]:
         # Stage 1 of MSTTRL reward computation: extract solution modes from the
@@ -510,135 +427,6 @@ class MultipleSolutionTTRLRewardManager(RewardManagerBase):
 
         return outputs
 
-    def _maintain_sets(self, rows: list[dict[str, Any]], outputs: list[dict[str, Any]]) -> None:
-        reward_sums: dict[str, float] = defaultdict(float)
-        for row, output in zip(rows, outputs, strict=True):
-            reward_sums[row["prompt_key"]] += float(output["reward_score"])
-
-        for prompt_key, reward_sum in reward_sums.items():
-            prev_sum = self.last_reward_sum.get(prompt_key)
-            self.last_reward_sum[prompt_key] = reward_sum
-            if prev_sum is None:
-                continue
-            self._self_reconsider_boundary_modes(prompt_key)
-
-    def _reconsider_boundary_modes(self, prompt_key: str) -> None:
-        sets = self.solution_sets[prompt_key]
-        counter = self.memory_bank[prompt_key]
-        if len(sets[SET_CORRECT]) > 1:
-            # The least-observed A% are the weakest members of S_t. Keep at
-            # least one accepted mode, matching the previous boundary rule.
-            count = min(
-                math.ceil(len(sets[SET_CORRECT]) * self.reconsider_correct_ratio),
-                len(sets[SET_CORRECT]) - 1,
-            )
-            modes = sorted(sets[SET_CORRECT], key=lambda item: (counter.get(item, 0), item))[:count]
-            sets[SET_CORRECT].difference_update(modes)
-            sets[SET_CANDIDATE].update(modes)
-        if len(sets[SET_WRONG]) > 1:
-            # The most-observed B% are repeatedly generated alternatives that
-            # deserve another check. Keep at least one rejected mode.
-            count = min(
-                math.ceil(len(sets[SET_WRONG]) * self.reconsider_wrong_ratio),
-                len(sets[SET_WRONG]) - 1,
-            )
-            modes = sorted(
-                sets[SET_WRONG], key=lambda item: (-counter.get(item, 0), item)
-            )[:count]
-            sets[SET_WRONG].difference_update(modes)
-            sets[SET_CANDIDATE].update(modes)
-
-    def _self_reconsider_boundary_modes(
-        self,
-        prompt_key: str,
-        model_output: str | None = None,
-    ) -> list[dict[str, str]] | list[str]:
-        """Build a self-reconsideration request or apply the model's selection.
-
-        Calling without ``model_output`` returns chat messages for the rollout
-        model. Calling again with its response moves valid selected modes from
-        correct to candidate. Hallucinated, malformed, duplicate, or excess
-        selections are ignored.
-        """
-        correct_modes = self.solution_sets[prompt_key][SET_CORRECT]
-        if len(correct_modes) <= 1:
-            return []
-
-        count = min(
-            math.ceil(len(correct_modes) * self.reconsider_correct_ratio),
-            len(correct_modes) - 1,
-        )
-        if count <= 0:
-            return []
-
-        data_source = self.data_source_bank[prompt_key]
-        formatted_to_mode = {
-            self._format_reconsider_candidate(mode, data_source): mode
-            for mode in correct_modes
-            if not self._is_invalid_mode(mode)
-        }
-        if model_output is None:
-            observations = self.observation_bank.get(prompt_key, [])
-            candidates = "\n".join(sorted(formatted_to_mode)) or "None"
-            if data_source == "3d":
-                ground_truth = self.ground_truth_bank.get(prompt_key, {})
-                system_prompt = THREE_D_RECONSIDER_SYSTEM_PROMPT
-                user_prompt = THREE_D_RECONSIDER_USER_TEMPLATE.format(
-                    count=count,
-                    grid_size=ground_truth.get("grid_size", 3),
-                    max_height=ground_truth.get("max_height", 3),
-                    observations="\n".join(observations) if observations else "No observations found.",
-                    candidates=candidates,
-                )
-            elif data_source == "boolean":
-                ground_truth = self.ground_truth_bank.get(prompt_key, {})
-                system_prompt = BOOLEAN_RECONSIDER_SYSTEM_PROMPT
-                user_prompt = BOOLEAN_RECONSIDER_USER_TEMPLATE.format(
-                    count=count,
-                    variables=", ".join(ground_truth.get("variables", ["x", "y"])),
-                    operators=", ".join(ground_truth.get("operators", ["AND", "OR", "NOT"])),
-                    max_depth=ground_truth.get("max_depth", 2),
-                    observations="\n".join(observations) if observations else "No observations found.",
-                    candidates=candidates,
-                )
-            else:
-                system_prompt = CAUSAL_RECONSIDER_SYSTEM_PROMPT
-                user_prompt = CAUSAL_RECONSIDER_USER_TEMPLATE.format(
-                    count=count,
-                    observations="\n".join(observations) if observations else "No observations found.",
-                    candidates=candidates,
-                )
-            return [
-                {"role": "system", "content": system_prompt},
-                {"role": "user", "content": user_prompt},
-            ]
-
-        selected_modes = []
-        has_invalid_selection = False
-        for line in (model_output or "").splitlines():
-            if not line.strip():
-                continue
-            match = re.fullmatch(r"\s*Suspicious Mode:\s*(.+?)\s*", line)
-            if match is None:
-                has_invalid_selection = True
-                continue
-            mode = formatted_to_mode.get(match.group(1))
-            if mode is None or mode in selected_modes:
-                has_invalid_selection = True
-                continue
-            selected_modes.append(mode)
-
-        if has_invalid_selection or len(selected_modes) != count:
-            self.epoch_self_reconsider_failure_count += 1
-        # Even when the model returns too many valid modes, only remove the
-        # first requested number, preserving the original reconsideration ratio.
-        selected_modes = selected_modes[:count]
-
-        sets = self.solution_sets[prompt_key]
-        sets[SET_CORRECT].difference_update(selected_modes)
-        sets[SET_CANDIDATE].update(selected_modes)
-        return selected_modes
-
     def _modes_to_verify(
         self,
         rows: list[dict[str, Any]],
@@ -759,7 +547,6 @@ class MultipleSolutionTTRLRewardManager(RewardManagerBase):
                 ),
             },
             "verifier_example": self.epoch_verifier_example,
-            "self_reconsider_failure_count": self.epoch_self_reconsider_failure_count,
         }
 
     @staticmethod
@@ -786,7 +573,6 @@ class MultipleSolutionTTRLRewardManager(RewardManagerBase):
         self.epoch_verifier_correct_count = 0
         self.epoch_verifier_correct_ground_truth_count = 0
         self.epoch_verifier_example = None
-        self.epoch_self_reconsider_failure_count = 0
         return {}
 
     def _set_rows(self, prompt_key: str, set_name: str) -> list[dict[str, Any]]:
@@ -1002,21 +788,6 @@ class MultipleSolutionTTRLRewardManager(RewardManagerBase):
     def _format_candidate_expression(cls, solution_mode: str) -> str:
         expression = cls._expression_from_solution_mode(solution_mode)
         return _format_expression(expression) if expression is not None else "<invalid>"
-
-    @classmethod
-    def _format_reconsider_candidate(cls, solution_mode: str, data_source: str) -> str:
-        if data_source == "3d":
-            structure = cls._structure_from_solution_mode(solution_mode)
-            if structure is None:
-                return "<invalid>"
-            layers = []
-            for layer_index, layer in enumerate(structure, start=1):
-                rows = "/".join(" ".join(str(value) for value in row) for row in layer)
-                layers.append(f"L{layer_index}={rows}")
-            return "; ".join(layers)
-        if data_source == "boolean":
-            return cls._format_candidate_expression(solution_mode)
-        return cls._format_candidate_graph(solution_mode)
 
     @staticmethod
     def _format_ground_truth(ground_truth: Any, data_source: str) -> dict[str, Any]:

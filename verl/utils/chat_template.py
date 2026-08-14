@@ -2,6 +2,7 @@
 import logging
 import os
 
+from jinja2.exceptions import TemplateError
 from transformers import PreTrainedTokenizerBase, ProcessorMixin
 
 from verl.utils.tokenizer import normalize_token_ids
@@ -26,14 +27,21 @@ def initialize_system_prompt(tokenizer, **apply_chat_template_kwargs) -> list[in
             [{"role": "user", "content": ""}], add_generation_prompt=False, tokenize=True, **apply_chat_template_kwargs
         )
     )
-    token2 = normalize_token_ids(
-        tokenizer.apply_chat_template(
-            [{"role": "user", "content": ""}] * 2,
-            add_generation_prompt=False,
-            tokenize=True,
-            **apply_chat_template_kwargs,
+    try:
+        messages = [{"role": "user", "content": ""}] * 2
+        token2 = normalize_token_ids(
+            tokenizer.apply_chat_template(
+                messages, add_generation_prompt=False, tokenize=True, **apply_chat_template_kwargs
+            )
         )
-    )
+    except TemplateError:
+        # Gemma requires strictly alternating user/assistant roles.
+        messages = [{"role": "user", "content": ""}, {"role": "assistant", "content": ""}]
+        token2 = normalize_token_ids(
+            tokenizer.apply_chat_template(
+                messages, add_generation_prompt=False, tokenize=True, **apply_chat_template_kwargs
+            )
+        )
     # get system prompt tokens
     system_prompt = token1[: -(len(token2) - len(token1))]
     return system_prompt

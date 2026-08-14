@@ -132,3 +132,5 @@ log
 outputs
 .history
 tensorboard_log/*
+
+*.o*

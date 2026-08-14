@@ -705,7 +705,6 @@ class RayPPOTrainer:
             "set_mode_correctness": data.get("set_mode_correctness", {}),
             "verifier_correct_set_accuracy": data.get("verifier_correct_set_accuracy", {}),
             "verifier_example": data.get("verifier_example"),
-            "self_reconsider_failure_count": data.get("self_reconsider_failure_count", 0),
             "solution_sets": data.get("solution_sets", []),
         }
         filename = os.path.join(root_dump_dir, "solution_sets", f"epoch_{epoch}.json")
