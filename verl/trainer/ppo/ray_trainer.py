@@ -267,6 +267,8 @@ def compute_advantage(
             "gated_ips_grpo",
             AdvantageEstimator.GATED_HISTORY_IPS_GRPO,
             "gated_history_ips_grpo",
+            AdvantageEstimator.PASS_GRPO_PENALIZED,
+            "pass_grpo_penalized",
         ):
             adv_kwargs["norm_adv_by_std_in_grpo"] = norm_adv_by_std_in_grpo
             adv_kwargs["non_tensor_batch"] = data.non_tensor_batch
@@ -855,6 +857,56 @@ class RayPPOTrainer:
             "msttrl/verify_parse_fail_count": float(stats.get("parse_fail_count", 0)),
         }
 
+    def _run_cocov_verification(self, batch: DataProto, timing_raw: dict | None = None) -> dict[str, Any]:
+        """Run CoCoV's second-pass verifier on Stage-1 candidate modes."""
+        assert self.reward_loop_manager is not None, "RewardLoopManager is None"
+        if timing_raw is None:
+            timing_raw = {}
+        verifier = self.reward_loop_manager.prepare_verification_batch(batch, reward_manager_name="cocov")
+        verifier_batch = verifier.get("batch")
+        if verifier_batch is None or len(verifier_batch) == 0:
+            return {
+                "cocov/verify_num_modes": 0.0,
+                "cocov/verify_num_samples": 0.0,
+                "cocov/route_a": float(verifier.get("high_groups", 0)),
+                "cocov/route_m": float(verifier.get("middle_groups", 0)),
+                "cocov/route_b1": 0.0,
+                "cocov/route_b2": float(verifier.get("low_groups", 0)),
+            }
+
+        verifier_batch.meta_info.update(
+            {
+                "eos_token_id": self.tokenizer.eos_token_id,
+                "pad_token_id": self.tokenizer.pad_token_id,
+                "recompute_log_prob": False,
+                "validate": False,
+                "global_steps": self.global_steps,
+            }
+        )
+        size_divisor = self.config.actor_rollout_ref.rollout.agent.num_workers
+        verifier_batch_padded, pad_size = pad_dataproto_to_divisor(verifier_batch, size_divisor)
+        with marked_timer("cocov_verify", timing_raw, color="orange"):
+            verifier_output_padded = self.async_rollout_manager.generate_sequences(verifier_batch_padded)
+        verifier_output = unpad_dataproto(verifier_output_padded, pad_size=pad_size)
+        verifier_texts = self._decode_responses(verifier_output)
+        stats = self.reward_loop_manager.apply_verification_results(
+            verifier.get("prompt_keys", []),
+            verifier.get("solution_modes", []),
+            verifier_texts,
+            reward_manager_name="cocov",
+        )
+        return {
+            "cocov/verify_num_modes": float(stats.get("num_modes", 0)),
+            "cocov/verify_num_samples": float(stats.get("num_samples", 0)),
+            "cocov/verify_true_count": float(stats.get("true_count", 0)),
+            "cocov/verify_false_count": float(stats.get("false_count", 0)),
+            "cocov/verify_parse_fail_count": float(stats.get("parse_fail_count", 0)),
+            "cocov/route_a": float(stats.get("route_a", 0)),
+            "cocov/route_m": float(stats.get("route_m", 0)),
+            "cocov/route_b1": float(stats.get("route_b1", 0)),
+            "cocov/route_b2": float(stats.get("route_b2", 0)),
+        }
+
     def _decode_responses(self, batch: DataProto) -> list[str]:
         # Rollout outputs concatenate prompts and responses in attention_mask;
         # only decode the generated response segment for verifier parsing.
@@ -873,6 +925,8 @@ class RayPPOTrainer:
         ttrl_enabled = bool(ttrl_config.get("enable", False))
         msttrl_config = self.config.get("msttrl", {})
         msttrl_enabled = bool(msttrl_config.get("enable", False))
+        cocov_config = self.config.get("cocov", {})
+        cocov_enabled = bool(cocov_config.get("enable", False))
 
         # Lists to collect samples for the table
         sample_inputs = []
@@ -916,7 +970,9 @@ class RayPPOTrainer:
             test_gen_batch_padded, pad_size = pad_dataproto_to_divisor(test_gen_batch, size_divisor)
             test_output_gen_batch_padded = self.async_rollout_manager.generate_sequences(test_gen_batch_padded)
 
-            if (ttrl_enabled or msttrl_enabled) and "rm_scores" not in test_output_gen_batch_padded.batch.keys():
+            if (
+                ttrl_enabled or msttrl_enabled or cocov_enabled
+            ) and "rm_scores" not in test_output_gen_batch_padded.batch.keys():
                 reward_manager_name = "msttrl" if msttrl_enabled else None
                 if msttrl_enabled and msttrl_config.get("method", "msttrl") == "verifier":
                     self._run_msttrl_verification(test_output_gen_batch_padded)
@@ -1739,18 +1795,23 @@ class RayPPOTrainer:
                 ttrl_enabled = bool(ttrl_config.get("enable", False))
                 msttrl_config = self.config.get("msttrl", {})
                 msttrl_enabled = bool(msttrl_config.get("enable", False))
-                if ttrl_enabled and msttrl_enabled:
-                    raise ValueError("ttrl.enable and msttrl.enable cannot be enabled at the same time.")
+                cocov_config = self.config.get("cocov", {})
+                cocov_enabled = bool(cocov_config.get("enable", False))
+                if sum((ttrl_enabled, msttrl_enabled, cocov_enabled)) > 1:
+                    raise ValueError("ttrl.enable, msttrl.enable, and cocov.enable are mutually exclusive.")
                 if msttrl_enabled and not self.config.actor_rollout_ref.rollout.calculate_log_probs:
                     raise ValueError("msttrl.enable requires actor_rollout_ref.rollout.calculate_log_probs=True.")
+                if cocov_enabled and not self.config.actor_rollout_ref.rollout.calculate_log_probs:
+                    raise ValueError("cocov.enable requires actor_rollout_ref.rollout.calculate_log_probs=True.")
 
-                sample_config = msttrl_config if msttrl_enabled else ttrl_config
+                sample_config = cocov_config if cocov_enabled else (msttrl_config if msttrl_enabled else ttrl_config)
                 n_samples_per_prompt = int(sample_config.get("n_samples_per_prompt", rollout_n))
-                n_votes_per_prompt = int(ttrl_config.get("n_votes_per_prompt", rollout_n))
+                vote_config = cocov_config if cocov_enabled else ttrl_config
+                n_votes_per_prompt = int(vote_config.get("n_votes_per_prompt", rollout_n))
                 ttrl_num_ans = int(ttrl_config.get("num_ans", 1))
                 if msttrl_enabled:
                     gen_repeat_times = n_samples_per_prompt
-                elif ttrl_enabled:
+                elif ttrl_enabled or cocov_enabled:
                     gen_repeat_times = n_votes_per_prompt
                 else:
                     gen_repeat_times = rollout_n
@@ -1777,9 +1838,9 @@ class RayPPOTrainer:
                         if curr_step_profile:
                             self.llm_server_manager.start_profile()
                         combined_gen_output = self.async_rollout_manager.generate_sequences(combined_gen_batch)
-                        # MSTTRL needs one more rollout pass for self-verifier
+                        # MSTTRL and CoCoV need one more rollout pass for self-verifier
                         # prompts, so keep replicas awake until verification ends.
-                        if not msttrl_enabled:
+                        if not (msttrl_enabled or cocov_enabled):
                             self.checkpoint_manager.sleep_replicas()
                         if curr_step_profile:
                             self.llm_server_manager.stop_profile()
@@ -1827,10 +1888,44 @@ class RayPPOTrainer:
                         for key in reward_extra_keys:
                             if key in gen_batch_output.non_tensor_batch:
                                 gen_batch_output.non_tensor_batch.pop(key)
+                    elif cocov_enabled:
+                        from verl.trainer.ppo.ttrl_utils import select_top_k_per_prompt
+
+                        # CoCoV verifies candidates using all Stage-1 votes, then
+                        # assigns pseudo-label rewards before retaining the first
+                        # n_samples_per_prompt trajectories for the policy update.
+                        cocov_vote_batch = batch.repeat(repeat_times=n_votes_per_prompt, interleave=True)
+                        cocov_vote_batch = cocov_vote_batch.union(gen_batch_output)
+                        metrics.update(self._run_cocov_verification(cocov_vote_batch, timing_raw))
+                        # Agent-loop rollouts may already carry the ordinary
+                        # ground-truth reward and its auxiliary fields.  CoCoV
+                        # replaces those with its routed pseudo-label reward;
+                        # leaving both copies in the DataProto makes ``union``
+                        # compare object arrays and, more importantly, risks
+                        # training on the stale reward.
+                        if "rm_scores" in cocov_vote_batch.batch:
+                            cocov_vote_batch.batch.pop("rm_scores")
+                        reward_extra_keys = cocov_vote_batch.meta_info.pop("reward_extra_keys", [])
+                        for key in reward_extra_keys:
+                            cocov_vote_batch.non_tensor_batch.pop(key, None)
+                        cocov_reward = self.reward_loop_manager.compute_rm_score(
+                            cocov_vote_batch, reward_manager_name="cocov"
+                        )
+                        cocov_vote_batch = cocov_vote_batch.union(cocov_reward)
+                        self.checkpoint_manager.sleep_replicas()
+                        gen_batch_output = select_top_k_per_prompt(
+                            cocov_vote_batch,
+                            n_votes_per_prompt=n_votes_per_prompt,
+                            n_samples_per_prompt=n_samples_per_prompt,
+                        )
+                        del cocov_vote_batch
                     del combined_gen_batch, combined_gen_output
                     # repeat to align with repeated responses in rollout
-                    batch = batch.repeat(repeat_times=n_samples_per_prompt, interleave=True)
-                    batch = batch.union(gen_batch_output)
+                    if cocov_enabled:
+                        batch = gen_batch_output
+                    else:
+                        batch = batch.repeat(repeat_times=n_samples_per_prompt, interleave=True)
+                        batch = batch.union(gen_batch_output)
 
                     if "response_mask" not in batch.batch.keys():
                         batch.batch["response_mask"] = compute_response_mask(batch)
@@ -1852,8 +1947,8 @@ class RayPPOTrainer:
                     batch.meta_info["images_seqlens"] = images_seqlens_all
                     with marked_timer("reward", timing_raw, color="yellow"):
                         # compute reward model score
-                        if (ttrl_enabled or msttrl_enabled) and "rm_scores" not in batch.batch.keys():
-                            reward_manager_name = "msttrl" if msttrl_enabled else None
+                        if (ttrl_enabled or msttrl_enabled or cocov_enabled) and "rm_scores" not in batch.batch.keys():
+                            reward_manager_name = "msttrl" if msttrl_enabled else ("cocov" if cocov_enabled else None)
                             if msttrl_enabled:
                                 # Verification must happen before compute_rm_score
                                 # because it routes solution modes into S/C/W sets.

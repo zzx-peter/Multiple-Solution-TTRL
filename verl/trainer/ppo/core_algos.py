@@ -20,6 +20,7 @@ implement PPO-like algorithms.
 
 __all__ = ["register_adv_est", "get_adv_estimator_fn", "AdvantageEstimator"]
 
+import math
 from collections import defaultdict
 from enum import Enum
 from typing import Any, Callable, Optional
@@ -102,6 +103,7 @@ class AdvantageEstimator(str, Enum):
     OPTIMAL_TOKEN_BASELINE = "optimal_token_baseline"
     TIR_OPTIMAL_TOKEN_BASELINE = "tir_optimal_token_baseline"
     GDPO = "gdpo"
+    PASS_GRPO_PENALIZED = "pass_grpo_penalized"
 
 
 ADV_ESTIMATOR_REGISTRY: dict[str, Any] = {}
@@ -459,6 +461,127 @@ def compute_ips_grpo_outcome_advantage(
 
         advantages = scaled_scores.unsqueeze(-1) * response_mask
     return advantages, advantages
+
+
+def _cocov_log_comb(n: int, k: int) -> float:
+    """Stable log binomial coefficient used by CoCoV's pass@k estimator."""
+    if k < 0 or n < 0 or k > n:
+        return float("-inf")
+    return math.lgamma(n + 1) - math.lgamma(k + 1) - math.lgamma(n - k + 1)
+
+
+@register_adv_est(AdvantageEstimator.PASS_GRPO_PENALIZED)
+def compute_pass_grpo_penalized_advantage(
+    token_level_rewards: torch.Tensor,
+    response_mask: torch.Tensor,
+    index: np.ndarray,
+    non_tensor_batch: Optional[dict] = None,
+    epsilon: float = 1e-6,
+    config: Optional[AlgoConfig] = None,
+    **kwargs,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """CoCoV pass@k advantage with its response-length diversity reward.
+
+    This is the released TTRL-CoCoV estimator adapted to verl's registered
+    estimator interface.  The selected pseudo-label samples use answer type 0;
+    every other response is negative.  Route-B2 groups are zeroed after the
+    estimator, matching ``two_stage_fallback_mode=no_update_both``.
+    """
+    if non_tensor_batch is None:
+        raise ValueError("pass_grpo_penalized requires CoCoV reward metadata.")
+    required = {"cocov_answer_type", "cocov_consistency", "cocov_zero_advantage"}
+    missing = required - set(non_tensor_batch)
+    if missing:
+        raise ValueError(f"pass_grpo_penalized is missing metadata: {sorted(missing)}")
+
+    answer_types = np.asarray(non_tensor_batch["cocov_answer_type"])
+    consistency_rates = np.asarray(non_tensor_batch["cocov_consistency"], dtype=np.float64)
+    zero_advantage = np.asarray(non_tensor_batch["cocov_zero_advantage"], dtype=np.float32)
+    batch_size = token_level_rewards.shape[0]
+    if not (len(answer_types) == len(consistency_rates) == len(zero_advantage) == batch_size):
+        raise ValueError("CoCoV advantage metadata must align with the rollout batch.")
+
+    k = int(config.get("k", 4)) if config is not None else 4
+    lam_div = float(config.get("lam_div", 0.05)) if config is not None else 0.05
+    c_max = float(config.get("c_max", 2.0)) if config is not None else 2.0
+    div_sc_threshold = float(config.get("div_sc_threshold", 0.6)) if config is not None else 0.6
+    if k < 1:
+        raise ValueError("algorithm.k must be at least 1.")
+
+    with torch.no_grad():
+        prompt_to_samples: dict[Any, list[int]] = defaultdict(list)
+        for sample_idx, prompt_idx in enumerate(index):
+            prompt_to_samples[prompt_idx].append(sample_idx)
+
+        actual_lengths = response_mask.sum(dim=-1).long().cpu().numpy()
+        scalar_advantages = np.zeros(batch_size, dtype=np.float64)
+
+        for sample_indices in prompt_to_samples.values():
+            group_size = len(sample_indices)
+            group_answers = answer_types[sample_indices]
+            consistency = float(consistency_rates[sample_indices[0]])
+            num_positive = int(np.count_nonzero(group_answers == 0))
+            num_negative = group_size - num_positive
+
+            log_fail = _cocov_log_comb(num_negative, k) - _cocov_log_comb(group_size, k)
+            prob_fail = float(np.exp(log_fail)) if np.isfinite(log_fail) else 0.0
+            prob_fail = float(np.clip(prob_fail, 0.0, 1.0))
+            reward_mean = 1.0 - prob_fail
+            std = math.sqrt(reward_mean * (1.0 - reward_mean))
+
+            if std < epsilon:
+                positive_advantage = 0.0
+                negative_advantage = 0.0
+            else:
+                positive_advantage = prob_fail / std
+                if num_negative >= 1:
+                    conditional_log_fail = _cocov_log_comb(num_negative - 1, k - 1) - _cocov_log_comb(
+                        group_size - 1, k - 1
+                    )
+                    conditional_fail = (
+                        float(np.exp(conditional_log_fail)) if np.isfinite(conditional_log_fail) else 0.0
+                    )
+                    conditional_fail = float(np.clip(conditional_fail, 0.0, 1.0))
+                else:
+                    conditional_fail = 0.0
+                negative_advantage = (prob_fail - conditional_fail) / std
+
+            group_raw = np.zeros(group_size, dtype=np.float64)
+            positive_lengths = [
+                int(actual_lengths[global_idx])
+                for local_idx, global_idx in enumerate(sample_indices)
+                if group_answers[local_idx] == 0
+            ]
+            length_mean = float(np.mean(positive_lengths)) if positive_lengths else 0.0
+            length_std = float(np.std(positive_lengths)) if positive_lengths else 0.0
+
+            for local_idx, _global_idx in enumerate(sample_indices):
+                is_positive = group_answers[local_idx] == 0
+                value = positive_advantage if is_positive else negative_advantage
+                if consistency > div_sc_threshold and is_positive and positive_lengths:
+                    length = int(actual_lengths[sample_indices[local_idx]])
+                    diversity = abs(length - length_mean) / (length_std + 1e-5)
+                    value += lam_div * min(diversity, c_max)
+                group_raw[local_idx] = value
+
+            if group_size > 1 and consistency > div_sc_threshold:
+                group_final = (group_raw - group_raw.mean()) / (group_raw.std() + epsilon)
+            else:
+                group_final = group_raw
+
+            for local_idx, global_idx in enumerate(sample_indices):
+                if group_answers[local_idx] == 0:
+                    group_final[local_idx] = max(positive_advantage, group_final[local_idx])
+                scalar_advantages[global_idx] = group_final[local_idx]
+
+        scalar_advantages *= 1.0 - zero_advantage
+        scalar_tensor = torch.as_tensor(
+            scalar_advantages,
+            dtype=token_level_rewards.dtype,
+            device=token_level_rewards.device,
+        )
+        advantages = scalar_tensor.unsqueeze(-1) * response_mask
+        return advantages, advantages.clone()
 
 
 @register_adv_est(AdvantageEstimator.GATED_IPS_GRPO)

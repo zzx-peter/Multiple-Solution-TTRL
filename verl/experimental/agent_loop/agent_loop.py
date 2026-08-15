@@ -545,13 +545,24 @@ class AgentLoopWorker:
         # NOTE: __do_sample__ is an internal per-sample override used by REMAX combined rollout.
         # Do not forward it to concrete agent loops, which may reject unknown kwargs.
         per_sample_do_sample = batch.non_tensor_batch.get("__do_sample__")
+        # CoCoV uses the same rollout replicas for a second, task-specific
+        # verifier pass.  Its high- and low-consistency routes have different
+        # sampling temperatures, so allow an internal per-sample override while
+        # keeping normal actor, validation, and REMAX sampling unchanged.
+        per_sample_sampling_params = batch.non_tensor_batch.get("__sampling_params__")
         tasks = []
         for i in range(len(batch)):
             trace_this_sample = i in traced_indices
-            kwargs = {k: v[i] for k, v in batch.non_tensor_batch.items() if k != "__do_sample__"}
+            kwargs = {
+                k: v[i]
+                for k, v in batch.non_tensor_batch.items()
+                if k not in {"__do_sample__", "__sampling_params__"}
+            }
             sample_sampling_params = dict(sampling_params)
             if not validate and per_sample_do_sample is not None and not bool(per_sample_do_sample[i]):
                 apply_greedy_sampling_params(sample_sampling_params)
+            if not validate and per_sample_sampling_params is not None:
+                sample_sampling_params.update(dict(per_sample_sampling_params[i]))
             tasks.append(
                 asyncio.create_task(
                     self._run_agent_loop(sample_sampling_params, trajectory_info[i], trace=trace_this_sample, **kwargs)
@@ -838,6 +849,12 @@ class AgentLoopWorker:
 
     async def _compute_score(self, outputs: list[AgentLoopOutput], kwargs: dict) -> None:
         """Compute reward score for all outputs in a trajectory; assigns result to outputs[-1]."""
+        # Internal verifier rollouts are scored later, after their True/False
+        # generations are aligned with candidate modes.  Running the ordinary
+        # task reward here would incorrectly treat verifier text as an actor
+        # answer and may not have task reward metadata at all.
+        if bool(kwargs.get("__skip_reward__", False)):
+            return
         enable_async_reward = self.reward_loop_worker_handles is not None
 
         final_output = outputs[-1]

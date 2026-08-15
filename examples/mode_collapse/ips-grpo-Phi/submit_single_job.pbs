@@ -17,4 +17,4 @@ trap 'rm -rf -- "$job_tmp"' EXIT
 apptainer exec --nv \
   --bind "$job_tmp:/tmp" \
   /scratch/Projects/CFP-04/CFP04-CF-024/ophv164/containers/verl-vllm017.sif \
-  bash examples/mode_collapse/ips-grpo-Phi/run_ips_grpo_3d.sh
+  bash examples/mode_collapse/ips-grpo-Phi/run_ips_grpo_boolean.sh

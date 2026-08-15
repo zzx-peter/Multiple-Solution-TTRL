@@ -18,6 +18,7 @@ from .gdpo import GDPORewardManager
 from .naive import NaiveRewardManager
 from .limited import RateLimitedRewardManager
 from .multiple_solution_ttrl import MultipleSolutionTTRLRewardManager
+from .cocov import CoCoVRewardManager
 from .remote import RemoteRewardManager
 
 __all__ = [
@@ -26,6 +27,7 @@ __all__ = [
     "NaiveRewardManager",
     "RateLimitedRewardManager",
     "MultipleSolutionTTRLRewardManager",
+    "CoCoVRewardManager",
     "RemoteRewardManager",
     "register",
     "get_reward_manager_cls",
