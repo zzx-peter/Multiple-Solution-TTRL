@@ -24,7 +24,7 @@ gpu_memory_utilization=0.5
 offload=True
 
 project_name="mode_collapse"
-experiment_name="Phi-4-mini-instruct-causal-reason-ttrl"
+experiment_name="Phi-4-mini-instruct-causal-reason-ttrl-copy"
 seed=1337
 
 main_model=/scratch/Projects/CFP-04/CFP04-CF-024/ophv164/model/Phi-4-mini-instruct

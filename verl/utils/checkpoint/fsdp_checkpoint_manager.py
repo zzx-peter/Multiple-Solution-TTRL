@@ -296,6 +296,10 @@ class FSDPCheckpointManager(BaseCheckpointManager):
             hf_config_tokenizer_path = os.path.join(local_path, "huggingface")
             local_mkdir_safe(hf_config_tokenizer_path)
             model_config = unwrap_model.config
+            if unwrap_model.__class__.__module__.startswith("transformers.models.") and hasattr(
+                model_config, "auto_map"
+            ):
+                delattr(model_config, "auto_map")
             generation_config = None
             if unwrap_model.can_generate() and hasattr(model_config, "name_or_path") and model_config.name_or_path:
                 try:
