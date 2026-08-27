@@ -251,7 +251,10 @@ class MultipleSolutionTTRLRewardManager(RewardManagerBase):
         if self.method == "verifier":
             verify_modes = {prompt_key: sorted(counter) for prompt_key, counter in generated_modes.items() if counter}
         else:
-            verify_modes = self._modes_to_verify(rows, generated_modes=generated_modes)
+            # Use the memory bank to reuse the state of previously verified modes
+            # verify_modes = self._modes_to_verify(rows, generated_modes=generated_modes)
+            # Ablation study: Do not use memory bank
+            verify_modes = self._current_step_modes_to_verify(rows, generated_modes=generated_modes)
         for prompt_key, counter in generated_modes.items():
             self.valid_mode_count_bank[prompt_key] += len(counter)
         for prompt_key, modes in verify_modes.items():
@@ -445,6 +448,22 @@ class MultipleSolutionTTRLRewardManager(RewardManagerBase):
             if modes:
                 verify_modes[prompt_key] = sorted(modes)
         return verify_modes
+
+    def _current_step_modes_to_verify(
+        self,
+        rows: list[dict[str, Any]],
+        generated_modes: dict[str, Counter[str]] | None = None,
+    ) -> dict[str, list[str]]:
+        """Select every distinct valid mode generated in the current step only.
+
+        Unlike ``_modes_to_verify``, this selection does not consult the saved
+        correct/candidate/wrong sets. Previously classified modes are therefore
+        verified again whenever they appear in the current rollout, while old
+        candidate modes absent from the current rollout are not included.
+        """
+        if generated_modes is None:
+            generated_modes = self._count_valid_modes(rows)
+        return {prompt_key: sorted(counter) for prompt_key, counter in generated_modes.items() if counter}
 
     @staticmethod
     def _count_valid_modes(rows: list[dict[str, Any]]) -> dict[str, Counter[str]]:

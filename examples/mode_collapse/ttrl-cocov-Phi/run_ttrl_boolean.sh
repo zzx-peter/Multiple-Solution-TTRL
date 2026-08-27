@@ -26,7 +26,7 @@ gpu_memory_utilization=0.5
 offload=True
 
 project_name="mode_collapse"
-experiment_name="Phi-4-mini-instruct-3d-reason-ttrl-cocov"
+experiment_name="Phi-4-mini-instruct-boolean-reason-ttrl-cocov"
 seed=1337
 
 main_model=/scratch/Projects/CFP-04/CFP04-CF-024/ophv164/model/Phi-4-mini-instruct
@@ -43,7 +43,6 @@ python3 -m verl.trainer.main_ppo \
     data.val_files="${test_files}" \
     data.train_batch_size=16 \
     +data.seed=${seed} \
-    +data.apply_chat_template_kwargs.enable_thinking=False \
     data.reward_fn_key=data_source \
     data.max_prompt_length=1024 \
     data.max_response_length=1024 \
@@ -98,9 +97,10 @@ python3 -m verl.trainer.main_ppo \
     trainer.experiment_name=${experiment_name} \
     trainer.n_gpus_per_node=${n_gpus_per_node} \
     trainer.nnodes=1 \
-    trainer.save_freq=500 \
+    trainer.save_freq=-1 \
     trainer.test_freq=5 \
     trainer.total_epochs=30 \
     trainer.log_val_generations=10 \
+    trainer.resume_mode=disable \
     trainer.default_local_dir=/scratch/Projects/CFP-04/CFP04-CF-024/ophv164/result/${project_name}/${experiment_name} \
     "$@"

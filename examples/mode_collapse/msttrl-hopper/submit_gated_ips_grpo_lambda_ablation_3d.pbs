@@ -1,0 +1,39 @@
+#!/bin/bash
+#PBS -P CFP04-CF-024
+#PBS -q auto
+#PBS -N msttrl-3d-gated-lambda
+#PBS -l select=1:ncpus=8:mem=64gb:ngpus=1
+#PBS -l walltime=08:00:00
+#PBS -j oe
+
+set -euo pipefail
+
+module load apptainer/1.3.1
+
+repo_dir=/scratch/Projects/CFP-04/CFP04-CF-024/ophv164/code/Multiple-Solution-TTRL
+container_image=/scratch/Projects/CFP-04/CFP04-CF-024/ophv164/containers/verl-vllm017.sif
+script_dir=examples/mode_collapse/msttrl-hopper
+
+cd "$repo_dir"
+
+job_tmp="$(mktemp -d "/tmp/verl-${PBS_JOBID}.XXXXXX")"
+trap 'rm -rf -- "$job_tmp"' EXIT
+
+echo "PBS job: $PBS_JOBID"
+echo "Compute node: $(hostname)"
+
+# gated_ips_grpo_lambda ablation for the 3d task.
+# Reference config lambda=0.9 (high=0.875 low=0.5 verifier_n=8) is already
+# trained and is skipped.
+lambda_values=(1.0)
+
+for lambda in "${lambda_values[@]}"; do
+    echo "Starting MSTTRL 3d gated_ips_grpo_lambda=${lambda} at $(date)"
+    apptainer exec --nv \
+        --bind "$job_tmp:/tmp" \
+        "$container_image" \
+        bash "${script_dir}/run_msttrl_3d.sh" "$lambda" 0.875 1337 0.5 8
+    echo "Finished MSTTRL 3d gated_ips_grpo_lambda=${lambda} at $(date)"
+done
+
+echo "All gated_ips_grpo_lambda ablation runs done."

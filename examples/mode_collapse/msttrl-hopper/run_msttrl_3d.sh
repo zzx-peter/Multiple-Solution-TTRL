@@ -16,6 +16,16 @@ if (( $# > 0 )); then
     shift
 fi
 
+low_threshold="${1:-0.5}"
+if (( $# > 0 )); then
+    shift
+fi
+
+verifier_n="${1:-8}"
+if (( $# > 0 )); then
+    shift
+fi
+
 export CUDA_VISIBLE_DEVICES=0
 export RAY_EXPERIMENTAL_NOSET_CUDA_VISIBLE_DEVICES=1
 export WANDB_API_KEY="3ad98c1a4043033c1a4ea70737ebb314a2f09ba0"
@@ -36,14 +46,13 @@ gpu_memory_utilization=0.5
 offload=True
 
 project_name="mode_collapse"
-experiment_name="Qwen3-1.7B-3d-gated-ips-msttrl_lambda_${gated_ips_grpo_lambda}_high_${high_threshold}_seed_${seed}"
+experiment_name="Qwen3-1.7B-3d-simple-verify-ips-grpo_verifiern_${verifier_n}_seed_${seed}"
 msttrl_dump_dir="/scratch/Projects/CFP-04/CFP04-CF-024/ophv164/result/${project_name}/${experiment_name}"
 
 main_model=/scratch/Projects/CFP-04/CFP04-CF-024/ophv164/model/Qwen3-1.7B
 
 python3 -m verl.trainer.main_ppo \
-    algorithm.adv_estimator=gated_ips_grpo \
-    +algorithm.gated_ips_grpo_lambda=${gated_ips_grpo_lambda} \
+    algorithm.adv_estimator=ips_grpo \
     algorithm.norm_adv_by_std_in_grpo=True \
     actor_rollout_ref.actor.policy_loss.loss_mode=vanilla \
     data.train_files="${train_files}" \
@@ -85,9 +94,8 @@ python3 -m verl.trainer.main_ppo \
     algorithm.kl_ctrl.kl_coef=0.0 \
     reward.num_workers=1 \
     +msttrl.enable=True \
-    +msttrl.high_threshold=${high_threshold} \
-    +msttrl.low_threshold=0.5 \
-    +msttrl.verifier_n=8 \
+    +msttrl.method=verifier \
+    +msttrl.verifier_n=${verifier_n} \
     +msttrl.dump_dir=${msttrl_dump_dir} \
     trainer.balance_batch=True \
     trainer.critic_warmup=0 \
@@ -97,9 +105,10 @@ python3 -m verl.trainer.main_ppo \
     trainer.experiment_name=${experiment_name} \
     trainer.n_gpus_per_node=${n_gpus_per_node} \
     trainer.nnodes=1 \
-    trainer.save_freq=500 \
+    trainer.save_freq=-1 \
     trainer.test_freq=5 \
     trainer.total_epochs=20 \
     trainer.log_val_generations=10 \
+    trainer.resume_mode=disable \
     trainer.default_local_dir=/scratch/Projects/CFP-04/CFP04-CF-024/ophv164/result/${project_name}/${experiment_name} \
     "$@"

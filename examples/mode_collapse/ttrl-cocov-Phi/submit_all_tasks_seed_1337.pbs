@@ -3,7 +3,7 @@
 #PBS -q auto
 #PBS -N ttrl-cocov-all
 #PBS -l select=1:ncpus=8:mem=64gb:ngpus=1
-#PBS -l walltime=05:00:00
+#PBS -l walltime=06:00:00
 #PBS -j oe
 
 set -euo pipefail
