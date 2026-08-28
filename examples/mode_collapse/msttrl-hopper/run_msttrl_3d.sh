@@ -94,7 +94,6 @@ python3 -m verl.trainer.main_ppo \
     algorithm.kl_ctrl.kl_coef=0.0 \
     reward.num_workers=1 \
     +msttrl.enable=True \
-    +msttrl.method=verifier \
     +msttrl.verifier_n=${verifier_n} \
     +msttrl.dump_dir=${msttrl_dump_dir} \
     trainer.balance_batch=True \

@@ -13,6 +13,7 @@ from verl import DataProto
 from verl.utils.reward_score.boolean import _expression_key, _format_expression
 from verl.utils.reward_score.boolean import _parse_prediction as _parse_boolean_prediction
 from verl.utils.reward_score.causal import _graph_key, _parse_prediction
+from verl.utils.reward_score.mace_math import _parse_prediction as _parse_mace_math_prediction
 from verl.utils.reward_score.three_d import _parse_prediction as _parse_3d_prediction
 from verl.utils.reward_score.three_d import _structure_key
 
@@ -96,6 +97,8 @@ def _majority_vote(
         return _majority_vote_3d(model_outputs, original_gt, num_ans=num_ans)
     if data_source == "boolean":
         return _majority_vote_boolean(model_outputs, original_gt, num_ans=num_ans)
+    if data_source == "mace_math":
+        return _majority_vote_mace_math(model_outputs, original_gt, num_ans=num_ans)
     raise NotImplementedError(f"TTRL majority voting is not implemented for data_source={data_source!r}")
 
 
@@ -232,4 +235,34 @@ def _make_boolean_ground_truth(expressions: list[tuple], original_gt: Any) -> di
     pseudo_gt["ground_truth_list"] = [
         {"formula": _format_expression(expression)} for expression in expressions
     ]
+    return pseudo_gt
+
+
+def _majority_vote_mace_math(
+    model_outputs: list[str],
+    original_gt: Any,
+    num_ans: int = 1,
+) -> tuple[dict[str, Any], list[str], float]:
+    predictions = [
+        prediction
+        for output in model_outputs
+        if (prediction := _parse_mace_math_prediction(output)) is not None
+    ]
+    if not predictions:
+        return _make_mace_math_ground_truth([], original_gt), [], 0.0
+
+    top_predictions = Counter(predictions).most_common(num_ans)
+    majority_ratio = top_predictions[0][1] / len(model_outputs)
+    majority_answers = [answer for answer, _ in top_predictions]
+    return (
+        _make_mace_math_ground_truth(majority_answers, original_gt),
+        majority_answers,
+        majority_ratio,
+    )
+
+
+def _make_mace_math_ground_truth(answers: list[str], original_gt: Any) -> dict[str, Any]:
+    pseudo_gt = dict(original_gt) if isinstance(original_gt, dict) else {}
+    pseudo_gt["ground_truth_list"] = answers
+    pseudo_gt["num_answers"] = len(answers)
     return pseudo_gt

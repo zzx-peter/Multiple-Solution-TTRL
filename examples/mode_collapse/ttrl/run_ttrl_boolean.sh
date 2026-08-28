@@ -80,7 +80,7 @@ python3 -m verl.trainer.main_ppo \
     trainer.experiment_name=${experiment_name} \
     trainer.n_gpus_per_node=${n_gpus_per_node} \
     trainer.nnodes=1 \
-    trainer.save_freq=500 \
+    trainer.save_freq=-1 \
     trainer.test_freq=5 \
     trainer.total_epochs=30 \
     trainer.log_val_generations=10 \

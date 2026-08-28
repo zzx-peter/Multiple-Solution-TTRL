@@ -600,6 +600,13 @@ class RayPPOTrainer:
                 "expressions": expressions,
             }
 
+        if ground_truth_list and all(not isinstance(item, dict) for item in ground_truth_list):
+            answers = sorted({str(item) for item in ground_truth_list})
+            return {
+                "num_answers": len(answers),
+                "answers": answers,
+            }
+
         graphs = []
         for graph in ground_truth_list:
             edges = graph.get("edges", []) if isinstance(graph, dict) else []
@@ -645,6 +652,8 @@ class RayPPOTrainer:
             final_answers = _list_from_non_tensor("3d_pred")
         if all(answer == "" for answer in final_answers):
             final_answers = _list_from_non_tensor("boolean_pred")
+        if all(answer == "" for answer in final_answers):
+            final_answers = _list_from_non_tensor("mace_math_pred")
         if all(answer == "" for answer in final_answers):
             final_answers = _list_from_non_tensor("pred")
 
@@ -1067,7 +1076,7 @@ class RayPPOTrainer:
             for var_name, metric2val in var2metric2val.items():
                 n_max = max([int(name.split("@")[-1].split("/")[0]) for name in metric2val.keys()])
                 for metric_name, metric_val in metric2val.items():
-                    is_hypospace_core_metric = data_source in {"causal", "3d", "boolean"} and var_name in (
+                    is_hypospace_core_metric = data_source in {"causal", "3d", "boolean", "mace_math"} and var_name in (
                         f"{data_source}_recovery",
                         "mode_recovery_rate",
                     )

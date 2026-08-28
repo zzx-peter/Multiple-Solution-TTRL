@@ -3,7 +3,7 @@
 #PBS -q auto
 #PBS -N ttrl-boolean-num-ans
 #PBS -l select=1:ncpus=8:mem=64gb:ngpus=1
-#PBS -l walltime=03:00:00
+#PBS -l walltime=06:00:00
 #PBS -j oe
 
 set -e
@@ -18,7 +18,7 @@ cd "$repo_dir"
 job_tmp="$(mktemp -d "/tmp/verl-${PBS_JOBID}.XXXXXX")"
 trap 'rm -rf -- "$job_tmp"' EXIT
 
-for num_ans in 2 3 4; do
+for num_ans in 3 3 3; do
     experiment_name="Qwen3-1.7B-boolean-reason-ttrl-num-ans-${num_ans}"
     run_tmp="${job_tmp}/num-ans-${num_ans}"
     mkdir -p "$run_tmp"

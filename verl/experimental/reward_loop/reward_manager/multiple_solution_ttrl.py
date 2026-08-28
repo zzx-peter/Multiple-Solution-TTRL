@@ -24,6 +24,7 @@ from verl.utils.reward_score.boolean import (
     _ground_truth_expression,
     _parse_formula,
 )
+from verl.utils.reward_score.mace_math import _normalize_answer
 from verl.utils.reward_score.three_d import (
     _canonical_structure,
     _format_structure,
@@ -135,10 +136,76 @@ or
 Verification Result: False
 """
 
+MACE_MATH_VERIFIER_SYSTEM_PROMPT = (
+    "You verify one integer candidate by doing the arithmetic yourself. The candidate is untrusted: "
+    "being inside the requested interval alone never proves it is valid. If the property check is "
+    "incomplete or uncertain, return False. Output plain text only."
+)
+
+MACE_MATH_VERIFIER_USER_TEMPLATE = """Verify whether the candidate answer satisfies the mathematical problem.
+
+Problem:
+{problem}
+
+Candidate answer:
+{candidate}
+
+The result is True exactly when the candidate is an integer inside the inclusive bounds and passes this test:
+{property_guidance}
+
+Recompute the test. Do not copy the task or candidate as proof.
+
+Return exactly two plain-text lines. Never use Markdown, LaTeX, or a box:
+Check: <one concise decisive calculation>
+Verification Result: True or False
+"""
+
+MACE_MATH_PROPERTY_GUIDANCE = {
+    "prime": (
+        "For n >= 2, test divisibility by every prime p <= floor(sqrt(n)). It is True only when none "
+        "divides n. State either an exact nontrivial factorization or the tested upper limit."
+    ),
+    "triangular": (
+        "Compute D = 8*n + 1. It is True exactly when D is an odd perfect square. State D and its "
+        "integer square root, or the two consecutive squares surrounding D."
+    ),
+    "square": (
+        "Compute s = floor(sqrt(n)). It is True exactly when s*s = n. State s and s*s."
+    ),
+    "cube": (
+        "Compute c = floor(cuberoot(n)). It is True exactly when c*c*c = n. State c and c*c*c."
+    ),
+    "fibonacci": (
+        "Compute 5*n*n + 4 and 5*n*n - 4. It is True exactly when at least one is a perfect square. "
+        "State both values and the relevant integer square root."
+    ),
+}
+
+
+def _mace_math_verifier_context(prompt_text: str) -> tuple[str, str, str]:
+    question_match = re.search(
+        r"Name\s+(?:a|an)\s+(?P<number_type>prime|square|cube|triangular|fibonacci)\s+number\s+"
+        r"between\s+(?P<lower>-?\d+)\s+and\s+(?P<upper>-?\d+)\.?",
+        prompt_text or "",
+        flags=re.IGNORECASE,
+    )
+    if question_match:
+        number_type = question_match.group("number_type").lower()
+        problem = (
+            f"Requested property: {number_type} number\n"
+            f"Inclusive bounds: {question_match.group('lower')} to {question_match.group('upper')}"
+        )
+    else:
+        problem = (prompt_text or "").strip()
+        lowered = problem.lower()
+        number_type = next((kind for kind in MACE_MATH_PROPERTY_GUIDANCE if kind in lowered), "prime")
+    return problem, MACE_MATH_PROPERTY_GUIDANCE[number_type], number_type
+
 TASK_PREDICTION_KEYS = {
     "causal": "causal_pred",
     "3d": "3d_pred",
     "boolean": "boolean_pred",
+    "mace_math": "mace_math_pred",
 }
 
 SET_CORRECT = "correct"
@@ -252,9 +319,9 @@ class MultipleSolutionTTRLRewardManager(RewardManagerBase):
             verify_modes = {prompt_key: sorted(counter) for prompt_key, counter in generated_modes.items() if counter}
         else:
             # Use the memory bank to reuse the state of previously verified modes
-            # verify_modes = self._modes_to_verify(rows, generated_modes=generated_modes)
+            verify_modes = self._modes_to_verify(rows, generated_modes=generated_modes)
             # Ablation study: Do not use memory bank
-            verify_modes = self._current_step_modes_to_verify(rows, generated_modes=generated_modes)
+            # verify_modes = self._current_step_modes_to_verify(rows, generated_modes=generated_modes)
         for prompt_key, counter in generated_modes.items():
             self.valid_mode_count_bank[prompt_key] += len(counter)
         for prompt_key, modes in verify_modes.items():
@@ -620,6 +687,8 @@ class MultipleSolutionTTRLRewardManager(RewardManagerBase):
             valid_modes = ground_truth.get("graphs", [])
         elif data_source == "boolean":
             valid_modes = ground_truth.get("expressions", [])
+        elif data_source == "mace_math":
+            valid_modes = ground_truth.get("answers", [])
         else:
             return False
         return candidate in set(valid_modes)
@@ -854,6 +923,13 @@ class MultipleSolutionTTRLRewardManager(RewardManagerBase):
                 "expressions": sorted(expressions),
             }
 
+        if data_source == "mace_math":
+            answers = sorted({_normalize_answer(answer) for answer in ground_truth_list})
+            return {
+                "num_answers": len(answers),
+                "answers": answers,
+            }
+
         graphs = []
         for graph in ground_truth_list:
             edges = graph.get("edges", []) if isinstance(graph, dict) else []
@@ -965,6 +1041,20 @@ class MultipleSolutionTTRLRewardManager(RewardManagerBase):
                         max_depth=ground_truth.get("max_depth", 2),
                         observations="\n".join(observations) if observations else "No observations found.",
                         candidate=self._format_candidate_expression(solution_mode),
+                    ),
+                },
+            ]
+        if data_source == "mace_math":
+            candidate = solution_mode.split(":", 1)[1] if ":" in solution_mode else solution_mode
+            problem, property_guidance, _ = _mace_math_verifier_context(prompt_text)
+            return [
+                {"role": "system", "content": MACE_MATH_VERIFIER_SYSTEM_PROMPT},
+                {
+                    "role": "user",
+                    "content": MACE_MATH_VERIFIER_USER_TEMPLATE.format(
+                        problem=problem,
+                        candidate=candidate or "<invalid>",
+                        property_guidance=property_guidance,
                     ),
                 },
             ]

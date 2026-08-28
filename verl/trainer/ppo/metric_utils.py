@@ -664,7 +664,12 @@ def process_validation_metrics(
             pred_vals = var2vals.get("pred")
             has_pred = pred_vals is not None
             var_dict = uid_dict.setdefault(uid, {})
-            recovery_prefix = {"causal": "causal", "3d": "3d", "boolean": "boolean"}.get(data_source)
+            recovery_prefix = {
+                "causal": "causal",
+                "3d": "3d",
+                "boolean": "boolean",
+                "mace_math": "mace_math",
+            }.get(data_source)
             mode_pred_vals = var2vals.get(f"{recovery_prefix}_pred") if recovery_prefix else None
             mode_valid_vals = var2vals.get(f"{recovery_prefix}_valid") if recovery_prefix else None
             mode_n_ground_truth_vals = (
