@@ -49,6 +49,12 @@ from verl.trainer.ppo.metric_utils import (
     compute_variance_proxy_metrics,
     process_validation_metrics,
 )
+from verl.trainer.ppo.rare_valid_metrics import (
+    compute_rare_valid_metrics,
+    format_epoch_metrics,
+    merge_epoch_totals,
+    new_epoch_totals,
+)
 from verl.trainer.ppo.reward import extract_reward
 from verl.trainer.ppo.utils import (
     Role,
@@ -1775,6 +1781,7 @@ class RayPPOTrainer:
         next_step_profile = False
 
         for epoch in range(current_epoch, self.config.trainer.total_epochs):
+            rare_valid_epoch_totals = new_epoch_totals()
             for step_in_epoch, batch_dict in enumerate(self.train_dataloader):
                 if hasattr(self.actor_rollout_wg, "async_calls_finalize_fn_exec"):
                     self.actor_rollout_wg.async_calls_finalize_fn_exec(blocking=False)
@@ -1808,6 +1815,13 @@ class RayPPOTrainer:
                 cocov_enabled = bool(cocov_config.get("enable", False))
                 if sum((ttrl_enabled, msttrl_enabled, cocov_enabled)) > 1:
                     raise ValueError("ttrl.enable, msttrl.enable, and cocov.enable are mutually exclusive.")
+                ips_grpo_enabled = self.config.algorithm.adv_estimator in (
+                    AdvantageEstimator.IPS_GRPO,
+                    "ips_grpo",
+                )
+                rare_valid_metrics_enabled = not msttrl_enabled and (
+                    ttrl_enabled or cocov_enabled or ips_grpo_enabled
+                )
                 if msttrl_enabled and not self.config.actor_rollout_ref.rollout.calculate_log_probs:
                     raise ValueError("msttrl.enable requires actor_rollout_ref.rollout.calculate_log_probs=True.")
                 if cocov_enabled and not self.config.actor_rollout_ref.rollout.calculate_log_probs:
@@ -2083,6 +2097,13 @@ class RayPPOTrainer:
                             norm_adv_by_std_in_grpo=norm_adv_by_std_in_grpo,
                             config=self.config.algorithm,
                         )
+
+                        if rare_valid_metrics_enabled:
+                            rare_valid_metrics, rare_valid_step_totals = compute_rare_valid_metrics(batch)
+                            metrics.update(rare_valid_metrics)
+                            merge_epoch_totals(rare_valid_epoch_totals, rare_valid_step_totals)
+                            if step_in_epoch == len(self.train_dataloader) - 1 or is_last_step:
+                                metrics.update(format_epoch_metrics(rare_valid_epoch_totals))
 
                     # update critic
                     if self.use_critic:

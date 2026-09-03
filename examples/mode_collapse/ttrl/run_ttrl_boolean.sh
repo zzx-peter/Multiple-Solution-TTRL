@@ -84,5 +84,6 @@ python3 -m verl.trainer.main_ppo \
     trainer.test_freq=5 \
     trainer.total_epochs=30 \
     trainer.log_val_generations=10 \
+    trainer.resume_mode=disable \
     trainer.default_local_dir=/scratch/Projects/CFP-04/CFP04-CF-024/ophv164/result/${project_name}/${experiment_name} \
     "$@"

@@ -1,0 +1,25 @@
+#!/bin/bash
+#PBS -P CFP04-CF-024
+#PBS -q auto
+#PBS -N mace-math-8b-cocov
+#PBS -l select=1:ncpus=8:mem=64gb:ngpus=2
+#PBS -l walltime=12:00:00
+#PBS -j oe
+
+set -euo pipefail
+
+module load apptainer/1.3.1
+
+repo_dir=/scratch/Projects/CFP-04/CFP04-CF-024/ophv164/code/Multiple-Solution-TTRL
+container_image=/scratch/Projects/CFP-04/CFP04-CF-024/ophv164/containers/verl-vllm017.sif
+run_script=examples/mode_collapse/MACE-MATH-8B/run_ttrl_cocov.sh
+
+cd "$repo_dir"
+
+job_tmp="$(mktemp -d "/tmp/verl-${PBS_JOBID}.XXXXXX")"
+trap 'rm -rf -- "$job_tmp"' EXIT
+
+apptainer exec --nv \
+    --bind "$job_tmp:/tmp" \
+    "$container_image" \
+    bash "$run_script"

@@ -3,7 +3,7 @@
 #PBS -q auto
 #PBS -N ttrl-cocov-all
 #PBS -l select=1:ncpus=8:mem=64gb:ngpus=1
-#PBS -l walltime=05:00:00
+#PBS -l walltime=08:00:00
 #PBS -j oe
 
 set -euo pipefail
@@ -19,7 +19,7 @@ cd "$repo_dir"
 job_tmp="$(mktemp -d "/tmp/verl-${PBS_JOBID}.XXXXXX")"
 trap 'rm -rf -- "$job_tmp"' EXIT
 
-for task in 3d boolean; do
+for task in causal 3d boolean; do
     task_tmp="${job_tmp}/${task}"
     mkdir -p "$task_tmp"
 

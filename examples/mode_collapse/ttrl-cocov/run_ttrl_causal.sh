@@ -98,9 +98,10 @@ python3 -m verl.trainer.main_ppo \
     trainer.experiment_name=${experiment_name} \
     trainer.n_gpus_per_node=${n_gpus_per_node} \
     trainer.nnodes=1 \
-    trainer.save_freq=500 \
+    trainer.save_freq=-1 \
     trainer.test_freq=5 \
     trainer.total_epochs=20 \
     trainer.log_val_generations=10 \
+    trainer.resume_mode=disable \
     trainer.default_local_dir=/scratch/Projects/CFP-04/CFP04-CF-024/ophv164/result/${project_name}/${experiment_name} \
     "$@"
