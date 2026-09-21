@@ -1,64 +1,96 @@
 # Multiple-Solution TTRL (MSTTRL)
 
-MSTTRL（Multiple-Solution Test-Time Reinforcement Learning）基于 verl，面向同一道题存在多个有效答案的推理任务。方法通过多次采样发现不同解，使用模型自验证估计每个解的可信度，再结合跨步记忆生成训练奖励，目标是在测试时学习中保留多种有效解。
+MSTTRL (Multiple-Solution Test-Time Reinforcement Learning) is built on verl for reasoning tasks
+where one prompt can have multiple valid solutions. The method samples multiple responses, uses
+the model to verify candidate solutions, and keeps a per-prompt memory of solution modes. The
+verification confidence becomes the training reward, allowing test-time learning to preserve and
+explore multiple valid solutions.
 
-## MSTTRL 方法
+## The MSTTRL method
 
-### 1. 采样与解的归一化
+### 1. Sampling and solution normalization
 
-对每个问题生成多条回答，通过任务解析器提取并归一化最终答案，得到不同的 solution mode。同一种解的重复出现会累积到该问题的历史计数中；无法解析的回答不进入解集合。
+For each prompt, the policy generates multiple responses. Task-specific parsers extract and
+normalize the final answer into a solution mode. Repeated occurrences of the same mode increase
+that prompt's history count. Responses that cannot be parsed are excluded from the solution sets.
 
-当前支持 causal graph、Boolean expression、3D structure 和 MACE-MATH 多答案任务。
+The implementation supports causal graphs, Boolean expressions, 3D structures, and MACE-MATH
+multi-answer tasks.
 
-### 2. 多次自验证
+### 2. Self-verification
 
-将问题中的约束和候选解组成验证提示，使用当前策略模型对每个待验证的解采样 `verifier_n` 次，解析 `Verification Result: True/False`，以有效投票中 True 的比例作为可信度 `p`。
+MSTTRL formats the prompt constraints and a candidate solution as a verifier prompt. The current
+policy samples the verifier response `verifier_n` times and parses
+`Verification Result: True` or `Verification Result: False`.
 
-无法解析的验证结果不计入分母；一个解的所有验证结果都无法解析时，按 `p = 0` 处理。默认每个解验证 8 次。验证判断可能有误，集合中的名称表示模型的置信判断。
+For a solution mode, its plausibility `p` is the fraction of valid verifier votes that are True.
+Unparseable verifier responses are excluded from the denominator. If every verifier response is
+unparseable, `p` is set to zero. The default is eight verifier samples per solution mode.
 
-### 3. 三类解集合与跨步记忆
+### 3. Three solution sets and cross-step memory
 
-为每个问题维护三个互斥集合，并根据验证可信度分配奖励：
+Each prompt owns three mutually exclusive sets. The verifier plausibility determines both the set
+and the reward:
 
-| 解集合 | 分配条件 | 训练奖励 |
+| Set | Routing condition | Training reward |
 | --- | --- | --- |
 | `correct` | `p >= high_threshold` | `1` |
 | `candidate` | `low_threshold < p < high_threshold` | `p` |
 | `wrong` | `p <= low_threshold` | `0` |
 
-默认阈值为 `high_threshold = 0.875`、`low_threshold = 0.5`。无法解析或尚未归类的解奖励为 0。
+The defaults are `high_threshold = 0.875` and `low_threshold = 0.5`. Invalid or unknown solution
+modes receive zero reward.
 
-当问题再次出现在训练批次中时，待验证集合由本次新解和历史 `candidate` 组成；已经进入 `correct` 或 `wrong` 的解复用已有判断。这样可以持续探索新解，并将验证开销集中到尚未确定的解上。记忆中的已确定判断也可能保留自验证错误。
+When a prompt appears again, MSTTRL verifies newly generated modes and retained `candidate`
+modes. Modes already classified as `correct` or `wrong` reuse their stored classification, which
+reduces repeated verification while continuing to explore new solutions. The memory is a model
+confidence state; a self-verifier can still make an incorrect classification.
 
-### 4. 策略更新与 verl 集成
+### 4. Policy update and verl integration
 
-将每条回答所属解的奖励送入策略更新。仓库提供 IPS-GRPO、Gated-IPS-GRPO 和使用历史计数的 `gated_history_ips_grpo`，具体选择由 `algorithm.adv_estimator` 控制。
+The reward attached to each response is passed to the policy update. The repository provides
+IPS-GRPO, Gated-IPS-GRPO, and `gated_history_ips_grpo`, which can use MSTTRL history metadata.
+The training entry point remains `python3 -m verl.trainer.main_ppo`.
 
-本仓库围绕 MSTTRL 对 verl 增加了以下实现：
+MSTTRL-specific changes in this repository include:
 
-- 状态化 reward manager：管理解的归一化、历史计数、三类集合与奖励。
-- 两阶段训练流程：候选回答生成后，再生成验证回答，聚合验证结果后计算训练奖励。
-- 诊断输出：记录解集合、可信度、历史出现次数、memory size 和 verifier 样例；另提供 rare-valid 指标分析稀有有效解。
+- A stateful reward manager in
+  `verl/experimental/reward_loop/reward_manager/multiple_solution_ttrl.py` for parsing solution
+  modes, maintaining memory, routing sets, and building rewards.
+- A two-stage rollout path: generate candidate responses, generate verifier responses, aggregate
+  verifier votes, then compute the training rewards.
+- Per-sample verifier rollout parameters and reward skipping for verifier-only samples.
+- Diagnostic state containing solution sets, plausibility, history counts, memory size, and verifier
+  examples.
+- Rare-valid metrics and reward metadata for analyzing uncommon but valid solutions.
 
-训练入口为 `python3 -m verl.trainer.main_ppo`。状态化 reward manager 要求 `reward.num_workers=1`，并开启 `actor_rollout_ref.rollout.calculate_log_probs=True`。通过 `+msttrl.enable=True` 启用方法。
+MSTTRL requires:
 
-### 实验目录
+~~~text
+reward.num_workers=1
+actor_rollout_ref.rollout.calculate_log_probs=True
++msttrl.enable=True
++msttrl.verifier_n=8
+~~~
 
-- examples/mode_collapse/msttrl-hopper/：MSTTRL causal、Boolean、3D；
-- examples/mode_collapse/MACE-MATH*/：MACE-MATH；
-- examples/mode_collapse/msttrl-hopper-ablation-*/：消融实验。
+### Experiment layout
 
-脚本默认读取外部 parquet、模型和输出目录，请按机器修改路径。大体积数据和模型不放入
-Git；运行时通过容器挂载。WANDB_API_KEY 应通过容器环境变量提供。
+- `examples/mode_collapse/msttrl-hopper/`: causal, Boolean, and 3D MSTTRL experiments.
+- `examples/mode_collapse/MACE-MATH*/`: MACE-MATH experiments.
+- `examples/mode_collapse/msttrl-hopper-ablation-*/`: candidate, memory, and Gated-IPS ablations.
 
-## Quick Start：verl Docker
+The scripts expect external parquet files, model checkpoints, and output directories. Large data and
+models are not stored in Git; mount them into the container. Provide `WANDB_API_KEY` through the
+container environment instead of hard-coding it in a script.
 
-宿主机需要 Docker、NVIDIA Container Toolkit 和可用的 nvidia-smi。镜像可以替换为你已有
-的 verl 镜像。
+## Quick Start with the verl Docker environment
 
-### 1. 创建容器
+The host must have Docker, NVIDIA Container Toolkit, and a working `nvidia-smi`. Replace the
+image name if you already have a compatible verl image.
 
-在仓库根目录执行：
+### 1. Create the container
+
+Run the following from the repository root:
 
 ~~~bash
 IMAGE=verlai/verl:vllm017.latest
@@ -72,16 +104,16 @@ docker start $CONTAINER
 docker exec -it $CONTAINER bash
 ~~~
 
-以后进入已有容器：
+For an existing container:
 
 ~~~bash
 docker start msttrl-verl
 docker exec -it msttrl-verl bash
 ~~~
 
-### 2. 安装仓库
+### 2. Install this repository
 
-在容器内：
+Inside the container:
 
 ~~~bash
 cd /workspace/verl
@@ -89,28 +121,31 @@ pip3 install --no-deps -e .
 python3 -c "import verl; print(verl.__file__)"
 ~~~
 
-verl Docker 镜像已经提供 CUDA、PyTorch、vLLM/SGLang 等依赖；使用 --no-deps 可避免重装
-依赖导致版本变化。
+The verl image already provides CUDA, PyTorch, and the vLLM/SGLang dependencies. Using
+`--no-deps` avoids replacing those versions. Install extra backend dependencies only when the
+selected image does not already provide them.
 
-### 3. 准备数据和模型
+### 3. Prepare data, model, and logging
 
-当前 main 不包含大体积数据和模型。把 parquet 和模型挂载到容器后设置：
+The repository does not include large datasets or model checkpoints. Mount them into the
+container and set paths such as:
 
 ~~~bash
 export MODEL_PATH=/models/Qwen3-1.7B
 export TRAIN_FILE=/data/hypespace/causal_reason/train.parquet
 export TEST_FILE=/data/hypespace/causal_reason/test.parquet
 export OUTPUT_DIR=/workspace/verl/outputs/msttrl
-export WANDB_API_KEY=你的_key
+export WANDB_API_KEY=your_key
 ~~~
 
-examples 使用的 data_source 包括 causal、boolean、3d 和 mace_math。显存不足时，优先
-降低 rollout.n、verifier_n、gpu_memory_utilization 或 batch size。
+The example tasks use `data_source` values such as `causal`, `boolean`, `3d`, and `mace_math`.
+If memory is limited, reduce `rollout.n`, `verifier_n`, `gpu_memory_utilization`, or the batch
+size first.
 
-### 4. 运行 MSTTRL
+### 4. Run MSTTRL
 
-先将 examples/mode_collapse/msttrl-hopper/run_msttrl_causal.sh 中的模型、数据和输出路径
-替换为容器内路径，然后执行：
+Edit the model, data, and output paths in
+`examples/mode_collapse/msttrl-hopper/run_msttrl_causal.sh`, then run:
 
 ~~~bash
 cd /workspace/verl
@@ -118,7 +153,10 @@ bash examples/mode_collapse/msttrl-hopper/run_msttrl_causal.sh \
   0.9 0.875 1337 8
 ~~~
 
-当前 causal 脚本使用 `ips_grpo`，后两个位置参数分别设置 seed 和 verifier_n；前两个为保留参数，当前脚本未将它们传入训练配置。修改阈值时可在命令末尾追加 `+msttrl.high_threshold=0.875`。以下仅列出 MSTTRL 核心配置，完整运行还需脚本中的模型、数据和 batch 等参数：
+The script accepts four positional arguments: a retained lambda argument, `high_threshold`, `seed`,
+and `verifier_n`. The current causal script uses `ips_grpo`; the retained lambda argument is kept
+for compatibility with existing experiment names and is not passed to the algorithm. The
+`low_threshold` can be overridden at the end of the command. The essential MSTTRL settings are:
 
 ~~~bash
 python3 -m verl.trainer.main_ppo \
@@ -134,28 +172,36 @@ python3 -m verl.trainer.main_ppo \
   +msttrl.dump_dir=/workspace/verl/outputs/msttrl
 ~~~
 
-### 5. 检查输出
+The full experiment scripts also set model, dataset, optimizer, FSDP, batch, and logging
+parameters.
 
-verl 的 trainer.default_local_dir 保存 checkpoint 和日志；MSTTRL 的 msttrl.dump_dir 保存
-solution sets、memory 统计和 verifier 样例。在已安装依赖的 verl 容器中运行相关 CPU 测试：
+### 5. Inspect outputs
+
+verl writes checkpoints and normal logs under `trainer.default_local_dir`. MSTTRL diagnostic
+snapshots under `msttrl.dump_dir` contain solution sets, memory statistics, and verifier examples.
+
+Run the focused CPU tests inside a container with the required dependencies:
 
 ~~~bash
-python3 -m pytest tests/experimental/reward_loop/test_multiple_solution_ttrl_on_cpu.py tests/trainer/ppo/test_ttrl_utils_on_cpu.py tests/trainer/ppo/test_rare_valid_metrics_on_cpu.py -q
+python3 -m pytest \
+  tests/experimental/reward_loop/test_multiple_solution_ttrl_on_cpu.py \
+  tests/trainer/ppo/test_ttrl_utils_on_cpu.py \
+  tests/trainer/ppo/test_rare_valid_metrics_on_cpu.py -q
 ~~~
 
-## 代码入口
+## Code entry points
 
 ~~~text
-verl/experimental/reward_loop/reward_manager/multiple_solution_ttrl.py  MSTTRL
-verl/trainer/ppo/core_algos.py                                         训练算法
-verl/trainer/ppo/rare_valid_metrics.py                                 稀有有效解
-verl/trainer/ppo/ray_trainer.py                                       verifier 集成
+verl/experimental/reward_loop/reward_manager/multiple_solution_ttrl.py  MSTTRL reward manager
+verl/trainer/ppo/core_algos.py                                         IPS/Gated-IPS advantages
+verl/trainer/ppo/rare_valid_metrics.py                                 rare-valid metrics
+verl/trainer/ppo/ray_trainer.py                                        verifier integration
 verl/utils/reward_score/mace_math/                                     MACE-MATH reward
-examples/mode_collapse/                                                 实验脚本
+examples/mode_collapse/msttrl-hopper/                                  MSTTRL experiments
 ~~~
 
-## 参考
+## References
 
 - verl: https://github.com/verl-project/verl
 - TTRL: https://arxiv.org/abs/2504.16084
-- 仓库：https://github.com/zzx-peter/Multiple-Solution-TTRL
+- Repository: https://github.com/zzx-peter/Multiple-Solution-TTRL
