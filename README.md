@@ -2,8 +2,7 @@
 
 MSTTRL (Multiple-Solution Test-Time Reinforcement Learning) is built on verl for reasoning tasks
 where one prompt can have multiple valid solutions. The method samples multiple responses, uses
-the model to verify candidate solutions, and keeps a per-prompt memory of solution modes. The
-verification confidence becomes the training reward, allowing test-time learning to preserve and
+the model to verify candidate solutions, and keeps a per-prompt memory of solution modes. The verifier plausibility (pass rate) becomes the training reward, allowing test-time learning to preserve and
 explore multiple valid solutions.
 
 ## The MSTTRL method
@@ -43,13 +42,11 @@ modes receive zero reward.
 
 When a prompt appears again, MSTTRL verifies newly generated modes and retained `candidate`
 modes. Modes already classified as `correct` or `wrong` reuse their stored classification, which
-reduces repeated verification while continuing to explore new solutions. The memory is a model
-confidence state; a self-verifier can still make an incorrect classification.
+reduces repeated verification while continuing to explore new solutions. The memory stores verifier judgments and classifications; a self-verifier can still make an incorrect classification.
 
 ### 4. Policy update and verl integration
 
-The reward attached to each response is passed to the policy update. The repository provides
-IPS-GRPO, Gated-IPS-GRPO, and `gated_history_ips_grpo`, which can use MSTTRL history metadata.
+The reward attached to each response is passed to the policy update. Select IPS-GRPO, Gated-IPS-GRPO, or `gated_history_ips_grpo` with the `algorithm.adv_estimator` configuration key. Only the history-aware variant uses MSTTRL history metadata.
 The training entry point remains `python3 -m verl.trainer.main_ppo`.
 
 MSTTRL-specific changes in this repository include:
@@ -64,7 +61,7 @@ MSTTRL-specific changes in this repository include:
   examples.
 - Rare-valid metrics and reward metadata for analyzing uncommon but valid solutions.
 
-MSTTRL requires:
+MSTTRL runtime requirements and the default verifier setting are:
 
 ~~~text
 reward.num_workers=1
@@ -153,10 +150,7 @@ bash examples/mode_collapse/msttrl-hopper/run_msttrl_causal.sh \
   0.9 0.875 1337 8
 ~~~
 
-The script accepts four positional arguments: a retained lambda argument, `high_threshold`, `seed`,
-and `verifier_n`. The current causal script uses `ips_grpo`; the retained lambda argument is kept
-for compatibility with existing experiment names and is not passed to the algorithm. The
-`low_threshold` can be overridden at the end of the command. The essential MSTTRL settings are:
+The script accepts four positional arguments: two reserved arguments, `seed`, and `verifier_n`. The current causal script uses `ips_grpo`; the first two arguments are stored for compatibility but are not passed to the training configuration. The third argument sets `+data.seed`, and the fourth sets `+msttrl.verifier_n`. Override the thresholds by appending `+msttrl.high_threshold=...` and/or `+msttrl.low_threshold=...`. The essential MSTTRL settings are:
 
 ~~~bash
 python3 -m verl.trainer.main_ppo \
