@@ -1,56 +1,50 @@
 # Multiple-Solution TTRL (MSTTRL)
 
-这是一个基于 verl 的 TTRL 研究仓库。当前 main 以 ttrl-cocov 分支为基础，包含 MSTTRL、
-TTRL-CoCoV、普通 TTRL 以及 mode-collapse 实验。运行目标是 verl 的 Docker 环境。
+MSTTRL（Multiple-Solution Test-Time Reinforcement Learning）基于 verl，面向同一道题存在多个有效答案的推理任务。方法通过多次采样发现不同解，使用模型自验证估计每个解的可信度，再结合跨步记忆生成训练奖励，目标是在测试时学习中保留多种有效解。
 
-## MSTTRL 修改内容
+## MSTTRL 方法
 
-### 状态化 multiple-solution reward
+### 1. 采样与解的归一化
 
-核心文件：verl/experimental/reward_loop/reward_manager/multiple_solution_ttrl.py
+对每个问题生成多条回答，通过任务解析器提取并归一化最终答案，得到不同的 solution mode。同一种解的重复出现会累积到该问题的历史计数中；无法解析的回答不进入解集合。
 
-- 为每个 prompt 维护 solution memory，并维护 correct、candidate、wrong 三个互斥集合。
-- 对新 mode 和候选 mode 进行多次 verifier rollout，按 high_threshold / low_threshold
-  的 pass rate 路由。
-- 高置信度解得到正奖励，低置信度解得到零奖励，中间区域保留为 candidate。
-- 复用历史 mode，记录 solution_mode、final_answer、history_count、集合计数、置信度和
-  memory size，并将诊断结果写入 msttrl.dump_dir。
-- 支持 causal graph、Boolean expression、3D structure 和 MACE-MATH 多答案任务。
+当前支持 causal graph、Boolean expression、3D structure 和 MACE-MATH 多答案任务。
 
-MSTTRL 必须满足：
+### 2. 多次自验证
 
-~~~text
-reward.num_workers=1
-actor_rollout_ref.rollout.calculate_log_probs=True
-+msttrl.enable=True
-+msttrl.verifier_n=8
-~~~
+将问题中的约束和候选解组成验证提示，使用当前策略模型对每个待验证的解采样 `verifier_n` 次，解析 `Verification Result: True/False`，以有效投票中 True 的比例作为可信度 `p`。
 
-### 二阶段 verifier 和 CoCoV
+无法解析的验证结果不计入分母；一个解的所有验证结果都无法解析时，按 `p = 0` 处理。默认每个解验证 8 次。验证判断可能有误，集合中的名称表示模型的置信判断。
 
-verl/trainer/ppo/ray_trainer.py、verl/experimental/agent_loop/agent_loop.py 和
-verl/trainer/main_ppo_sync.py 增加了 verifier rollout 数据流：第一阶段生成候选，第二阶段
-使用独立 sampling 参数验证，并用 __skip_reward__ 跳过普通 reward。
+### 3. 三类解集合与跨步记忆
 
-verl/experimental/reward_loop/reward_manager/cocov.py 实现 CoCoV 的 A/M/B1/B2 路由：
+为每个问题维护三个互斥集合，并根据验证可信度分配奖励：
 
-- A：高一致性，保留 majority pseudo-label；
-- M：中等一致性，直接使用 majority label；
-- B1：低一致性但有通过 verifier 的候选，选择通过验证的候选；
-- B2：低一致性且无通过候选，保留诊断信息并抑制对应 advantage。
+| 解集合 | 分配条件 | 训练奖励 |
+| --- | --- | --- |
+| `correct` | `p >= high_threshold` | `1` |
+| `candidate` | `low_threshold < p < high_threshold` | `p` |
+| `wrong` | `p <= low_threshold` | `0` |
 
-### 算法、reward 和指标
+默认阈值为 `high_threshold = 0.875`、`low_threshold = 0.5`。无法解析或尚未归类的解奖励为 0。
 
-- 新增 pass_grpo_penalized，结合 pass@k 与长度/多样性惩罚；
-- 扩展 IPS-GRPO、Gated-IPS-GRPO 和 history-aware advantage；
-- 新增 MACE-MATH 多参考答案 reward；
-- 新增 rare-valid metrics；
-- 所有训练仍从 python3 -m verl.trainer.main_ppo 进入。
+当问题再次出现在训练批次中时，待验证集合由本次新解和历史 `candidate` 组成；已经进入 `correct` 或 `wrong` 的解复用已有判断。这样可以持续探索新解，并将验证开销集中到尚未确定的解上。记忆中的已确定判断也可能保留自验证错误。
+
+### 4. 策略更新与 verl 集成
+
+将每条回答所属解的奖励送入策略更新。仓库提供 IPS-GRPO、Gated-IPS-GRPO 和使用历史计数的 `gated_history_ips_grpo`，具体选择由 `algorithm.adv_estimator` 控制。
+
+本仓库围绕 MSTTRL 对 verl 增加了以下实现：
+
+- 状态化 reward manager：管理解的归一化、历史计数、三类集合与奖励。
+- 两阶段训练流程：候选回答生成后，再生成验证回答，聚合验证结果后计算训练奖励。
+- 诊断输出：记录解集合、可信度、历史出现次数、memory size 和 verifier 样例；另提供 rare-valid 指标分析稀有有效解。
+
+训练入口为 `python3 -m verl.trainer.main_ppo`。状态化 reward manager 要求 `reward.num_workers=1`，并开启 `actor_rollout_ref.rollout.calculate_log_probs=True`。通过 `+msttrl.enable=True` 启用方法。
 
 ### 实验目录
 
 - examples/mode_collapse/msttrl-hopper/：MSTTRL causal、Boolean、3D；
-- examples/mode_collapse/ttrl-cocov/：CoCoV causal、Boolean、3D；
 - examples/mode_collapse/MACE-MATH*/：MACE-MATH；
 - examples/mode_collapse/msttrl-hopper-ablation-*/：消融实验。
 
@@ -124,7 +118,7 @@ bash examples/mode_collapse/msttrl-hopper/run_msttrl_causal.sh \
   0.9 0.875 1337 8
 ~~~
 
-位置参数依次是脚本保留的 lambda 参数、high_threshold、seed 和 verifier_n；当前 causal 脚本使用 ips_grpo，lambda 参数主要用于兼容已有实验命名。核心配置为：
+当前 causal 脚本使用 `ips_grpo`，后两个位置参数分别设置 seed 和 verifier_n；前两个为保留参数，当前脚本未将它们传入训练配置。修改阈值时可在命令末尾追加 `+msttrl.high_threshold=0.875`。以下仅列出 MSTTRL 核心配置，完整运行还需脚本中的模型、数据和 batch 等参数：
 
 ~~~bash
 python3 -m verl.trainer.main_ppo \
@@ -140,19 +134,10 @@ python3 -m verl.trainer.main_ppo \
   +msttrl.dump_dir=/workspace/verl/outputs/msttrl
 ~~~
 
-运行 CoCoV：
-
-~~~bash
-bash examples/mode_collapse/ttrl-cocov/run_ttrl_causal.sh
-~~~
-
-CoCoV 参数包括 +cocov.verifier_n、+cocov.high_threshold、+cocov.low_threshold、
-+cocov.high_max_candidates 和 +cocov.low_max_candidates。
-
 ### 5. 检查输出
 
 verl 的 trainer.default_local_dir 保存 checkpoint 和日志；MSTTRL 的 msttrl.dump_dir 保存
-solution sets、memory 统计和 verifier 样例。CPU 指标测试：
+solution sets、memory 统计和 verifier 样例。在已安装依赖的 verl 容器中运行相关 CPU 测试：
 
 ~~~bash
 python3 -m pytest tests/experimental/reward_loop/test_multiple_solution_ttrl_on_cpu.py tests/trainer/ppo/test_ttrl_utils_on_cpu.py tests/trainer/ppo/test_rare_valid_metrics_on_cpu.py -q
@@ -162,7 +147,6 @@ python3 -m pytest tests/experimental/reward_loop/test_multiple_solution_ttrl_on_
 
 ~~~text
 verl/experimental/reward_loop/reward_manager/multiple_solution_ttrl.py  MSTTRL
-verl/experimental/reward_loop/reward_manager/cocov.py                 CoCoV
 verl/trainer/ppo/core_algos.py                                         训练算法
 verl/trainer/ppo/rare_valid_metrics.py                                 稀有有效解
 verl/trainer/ppo/ray_trainer.py                                       verifier 集成
