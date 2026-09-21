@@ -5,7 +5,7 @@ ttrl_num_ans="${TTRL_NUM_ANS:-1}"
 
 export CUDA_VISIBLE_DEVICES=0,1
 export RAY_EXPERIMENTAL_NOSET_CUDA_VISIBLE_DEVICES=1
-export WANDB_API_KEY="3ad98c1a4043033c1a4ea70737ebb314a2f09ba0"
+export WANDB_API_KEY="${WANDB_API_KEY:-}"
 export PYTHONPATH=/scratch/ophv164/code/verl-v0.8.0:$PYTHONPATH
 three_d_path="/scratch/Projects/CFP-04/CFP04-CF-024/ophv164/data/hypespace/3d_reason/train.parquet"
 three_d_test_path="/scratch/Projects/CFP-04/CFP04-CF-024/ophv164/data/hypespace/3d_reason/test.parquet"

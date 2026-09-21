@@ -18,7 +18,7 @@ fi
 
 export CUDA_VISIBLE_DEVICES=0,1
 export RAY_EXPERIMENTAL_NOSET_CUDA_VISIBLE_DEVICES=1
-export WANDB_API_KEY="3ad98c1a4043033c1a4ea70737ebb314a2f09ba0"
+export WANDB_API_KEY="${WANDB_API_KEY:-}"
 export PYTHONPATH=/scratch/Projects/CFP-04/CFP04-CF-024/ophv164/code/Multiple-Solution-TTRL:$PYTHONPATH
 
 causal_path="/scratch/Projects/CFP-04/CFP04-CF-024/ophv164/data/hypespace/causal_reason/train.parquet"

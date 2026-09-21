@@ -2,7 +2,7 @@
 set -x
 export CUDA_VISIBLE_DEVICES=0
 export RAY_EXPERIMENTAL_NOSET_CUDA_VISIBLE_DEVICES=1
-export WANDB_API_KEY="3ad98c1a4043033c1a4ea70737ebb314a2f09ba0"
+export WANDB_API_KEY="${WANDB_API_KEY:-}"
 export PYTHONPATH=/scratch/ophv164/code/verl-v0.8.0:$PYTHONPATH
 causal_path="/scratch/ophv164/data/hypespace/causal_reason/train.parquet"
 causal_test_path="/scratch/ophv164/data/hypespace/causal_reason/test.parquet"
