@@ -193,9 +193,3 @@ verl/trainer/ppo/ray_trainer.py                                        verifier 
 verl/utils/reward_score/mace_math/                                     MACE-MATH reward
 examples/mode_collapse/msttrl-hopper/                                  MSTTRL experiments
 ~~~
-
-## References
-
-- verl: https://github.com/verl-project/verl
-- TTRL: https://arxiv.org/abs/2504.16084
-- Repository: https://github.com/zzx-peter/Multiple-Solution-TTRL
